@@ -179,6 +179,143 @@ QUICK_SLOT_SCAN_INTERVAL_TICKS = 10
 QUICK_SLOT_NAMES = ["Shift", "Ins", "Home", "PgUp", "Ctrl", "Del", "End", "PgDn"]
 QUICK_SLOT_COUNT = 8
 
+# OCR readings of the tiny key labels above each quickbar slot are fuzzy
+# ("Shit" for Shift, "Pup" for PgUp, "Dell" for Del...). _match_quick_key()
+# normalises them back to QUICK_SLOT_NAMES so the key labels can anchor the
+# real slot geometry (see _quickbar_slots_from_boxes) instead of blindly
+# dividing the whole crop into 8 equal cells -- the crop includes blank
+# margins, so equal division landed counts in the WRONG slot (measured on
+# samples/maple_story_ui_20260906_a/b.png: 181/1056 were read fine but
+# assigned one slot left of the real one, 2026-09-06).
+_QUICK_KEY_TEXT = {
+    "shift": "Shift", "shit": "Shift", "shif": "Shift", "shft": "Shift", "sft": "Shift",
+    "ins": "Ins", "lns": "Ins", "ims": "Ins", "insl": "Ins",
+    "home": "Home", "hom": "Home", "hm": "Home", "hme": "Home", "hone": "Home",
+    "pgup": "PgUp", "pgu": "PgUp", "pup": "PgUp", "pg": "PgUp",
+    "ctrl": "Ctrl", "ctl": "Ctrl", "ctr": "Ctrl", "ctri": "Ctrl", "crl": "Ctrl",
+    "del": "Del", "dell": "Del", "dei": "Del", "de1": "Del", "de": "Del", "dei": "Del",
+    "end": "End", "endd": "End", "en": "End", "erd": "End",
+    "pgdn": "PgDn", "pgd": "PgDn", "pdn": "PgDn", "pgn": "PgDn",
+}
+_QUICK_TOP_KEYS = QUICK_SLOT_NAMES[:4]  # top row order: Shift, Ins, Home, PgUp
+
+
+def _match_quick_key(text: str) -> str | None:
+    """Normalise an OCR'd quickbar key label to its standard name, or None."""
+    t = text.strip().lower().replace(" ", "")
+    if t in _QUICK_KEY_TEXT:
+        return _QUICK_KEY_TEXT[t]
+    if len(t) >= 4:
+        for variant, name in _QUICK_KEY_TEXT.items():
+            if t.startswith(variant) or variant.startswith(t):
+                return name
+    return None
+
+
+def _pure_digits(text: str) -> bool:
+    return bool(text.strip()) and all(ch in "0123456789," for ch in text.strip())
+
+
+def _quickbar_slots_from_boxes(
+    boxes: list[tuple[int, int, int, int, str]], w: int, h: int,
+) -> dict[int, int]:
+    """Assign pure-digit OCR boxes to quickbar slots (1-8) using the key
+    labels above each slot as geometry anchors.
+
+    The quickbar row renders each slot's key label on top (Shift/Ins/...),
+    so a detected key label tells us where that slot actually starts --
+    dividing the crop into equal eighths is wrong because the crop contains
+    blank margins and slot borders (measured 2026-09-06: equal division put
+    slot-4/8 potion counts one slot left). Falls back to equal division when
+    no key label is readable (tiny native-res text).
+    """
+    keys: list[tuple[str, int, int, int, int]] = []
+    digs: list[tuple[str, int, int, int, int]] = []
+    for x, y, bw, bh, text in boxes:
+        k = _match_quick_key(text)
+        if k:
+            keys.append((k, x, y, bw, bh))
+        elif _pure_digits(text):
+            digs.append((text, x, y, bw, bh))
+
+    # Row geometry: key labels of the top row sit at the same y; the bottom
+    # row's labels (and the slot content) sit one slot-height below.
+    keys.sort(key=lambda kb: (kb[2], kb[1]))
+    result: dict[int, int] = {}
+
+    if not keys:
+        # Fallback: equal division over the crop (original behaviour).
+        for text, x, y, bw, bh in digs:
+            val = parse_meso(text)
+            if val is None:
+                continue
+            cx, cy = x + bw / 2.0, y + bh / 2.0
+            col = int(cx / (w / 4.0))
+            row = int(cy / (h / 2.0))
+            if 0 <= col < 4 and 0 <= row < 2:
+                result[row * 4 + col + 1] = val
+        return result
+
+    # Top-row key labels anchor the four column centres. The labels' NAMES
+    # fix their logical column (Shift=0..PgUp=3), so the slot width comes
+    # from the OUTERMOST readable labels divided by their column distance --
+    # averaging neighbouring gaps breaks when a middle label (e.g. Home)
+    # isn't read and leaves one oversized gap (measured 2026-09-06).
+    top_y = keys[0][2]
+    top_keys = [kb for kb in keys if kb[2] <= top_y + 12]
+    top_keys.sort(key=lambda kb: kb[1])
+    by_col: dict[int, float] = {}
+    for k, x, _y, bw, _bh in top_keys:
+        if k not in _QUICK_TOP_KEYS:
+            continue
+        col = _QUICK_TOP_KEYS.index(k)
+        cx = x + bw / 2.0
+        if col not in by_col:
+            by_col[col] = cx
+    if not by_col:
+        return result
+    cols_sorted = sorted(by_col)
+    c0, cN = cols_sorted[0], cols_sorted[-1]
+    x0c, xNc = by_col[c0], by_col[cN]
+    if cN > c0:
+        cw = (xNc - x0c) / (cN - c0)
+    else:
+        cw = max(10.0, w / 8.0)
+    # Every column centre follows the same spacing, even the ones whose
+    # label wasn't read.
+    filled: dict[int, float] = {c: x0c + (c - c0) * cw for c in range(4)}
+    # Bottom row sits one slot-height below the top labels. Height is the
+    # slot width when no bottom label was read (slots are square-ish).
+    bot_labels = [kb for kb in keys if kb[2] > top_y + 12]
+    if bot_labels:
+        bot_top = min(kb[2] for kb in bot_labels)
+        row_h = max(20.0, bot_top - top_y)
+    else:
+        row_h = max(20.0, cw)
+
+    for text, x, y, bw, bh in digs:
+        cx, cy = x + bw / 2.0, y + bh / 2.0
+        col = None
+        for c in range(4):
+            x0 = filled[c] - cw / 2.0
+            x1 = filled[c] + cw / 2.0
+            if x0 - 2 <= cx <= x1 + 2:
+                col = c
+                break
+        if col is None:
+            continue
+        if cy < top_y + row_h * 0.9:
+            row = 0
+        elif cy < top_y + row_h * 2.0:
+            row = 1
+        else:
+            continue  # below the quickbar (bottom toolbar counts etc.)
+        slot = row * 4 + col + 1
+        val = parse_meso(text)
+        if val is not None:
+            result[slot] = val
+    return result
+
 # Number of history sessions at which the History tab starts nudging the user
 # to clean up old records (see _update_history_summary).
 _HISTORY_CLEANUP_THRESHOLD = 50
@@ -1628,11 +1765,21 @@ class OverlayApp:
         """Detect the potion count in each of the 8 quickbar slots, returning
         {slot_index: count} for slots whose count was read. Detection (not
         recognition-only) is used because the count sits at a variable spot
-        inside each slot; the small region keeps it cheap. Keys/other text
-        are filtered out by parse_meso (digit-run only)."""
+        inside each slot; the small region keeps it cheap. The count is
+        assigned to its slot by the key labels above each slot
+        (_quickbar_slots_from_boxes) -- equal division landed counts in the
+        wrong slot because the crop includes blank margins (2026-09-06)."""
         img = self._grab_quick_bar_image()
         if img is None:
             return {}
+        # Tiny native-resolution quickbars read badly at 1x -- upscale small
+        # crops before detection (LANCZOS, cheap on a <300px-wide region).
+        scale = 1
+        if min(img.size) < 300:
+            scale = 2
+            img = img.resize(
+                (img.width * scale, img.height * scale), Image.Resampling.LANCZOS
+            )
         try:
             boxes = self._ocr.detect_text(img)
         except Exception:
@@ -1640,18 +1787,13 @@ class OverlayApp:
         w, h = img.size
         if w <= 0 or h <= 0:
             return {}
-        result: dict[int, int] = {}
-        for x, y, bw, bh, text in boxes:
-            val = parse_meso(text)
-            if val is None:
-                continue
-            cx, cy = x + bw / 2.0, y + bh / 2.0
-            col = int(cx / (w / 4.0))
-            row = int(cy / (h / 2.0))
-            if 0 <= col < 4 and 0 <= row < 2:
-                slot = row * 4 + col + 1
-                result[slot] = val
-        return result
+        if scale > 1:
+            boxes = [
+                (int(x // scale), int(y // scale), int(bw // scale), int(bh // scale), text)
+                for x, y, bw, bh, text in boxes
+            ]
+            w, h = w // scale, h // scale
+        return _quickbar_slots_from_boxes(boxes, w, h)
 
     def _scan_quick_slots_to_last(self) -> None:
         """Read the quick-slot potion counts and stash them in the _last_*

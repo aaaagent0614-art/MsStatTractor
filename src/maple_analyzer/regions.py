@@ -39,7 +39,7 @@ FIELD_BOXES = {
 # samples/maple_story_ui.jpg (x≈933-1063 of 1351, y≈666-711 of 800) and the
 # 1920x1077 sample. Used as the auto-detect position when the user hasn't
 # marked the quickbar manually (see Settings.manual_quick_bar_region).
-QUICK_BAR_FRAC = (0.685, 0.815, 0.795, 0.905)  # (left, top, right, bottom) as fractions
+QUICK_BAR_FRAC = (0.60, 0.78, 0.92, 0.94)  # (left, top, right, bottom) as fractions
 
 
 @dataclass(frozen=True)
