@@ -231,6 +231,79 @@ def find_meso_in_region(
     return best[1], best[2], best[3], best[4], best[5]
 
 
+# ---- coin-icon verification (2026-09-06, method A) -----------------------
+# find_meso_candidate trusts "the largest pure-digit blob on screen", which a
+# stray LARGER number elsewhere (chat, floating damage, another window) can
+# steal. Method A (user's suggestion, 2026-09-06): a candidate is only the
+# meso counter when the coin icon sits immediately to its LEFT -- the classic
+# inventory's meso row renders  [coin icon] [1,371,339] 楓幣. The coin is
+# found by colour (golden yellow), not template matching, so it survives
+# Magpie upscaling (colour doesn't change with scale). Candidates are tried
+# in the old order (most digits, then lower on screen) and the first one with
+# enough gold pixels to its left wins.
+#
+# Tuning measured on samples/maple_story_ui_20260906_1841x1035.png: the real
+# meso box has ~157 gold pixels in the lookbehind window; a floating damage
+# number ("1048") has 0. Threshold 60 keeps a comfortable margin on both
+# sides (a 1.348x downscale to the native 1366x768 still leaves ~87).
+_GOLD_LEFT_LOOKBACK = 90  # how far left of the box to look
+_GOLD_LEFT_VPAD = 12      # vertical padding above/below the box
+_GOLD_MIN_PX = 60         # gold pixels required in that window
+
+
+def _count_gold_left_of(frame_rgb, x: int, y: int, w: int, h: int) -> int:
+    """Number of coin-gold pixels in the window immediately left of a box.
+    `frame_rgb` is a PIL Image or HxWx3 numpy RGB array of the full frame."""
+    import numpy as np
+    from PIL import Image
+
+    if frame_rgb is None:
+        return 0
+    hsv = np.asarray(Image.fromarray(np.asarray(frame_rgb)).convert("HSV"))
+    H, S, V = hsv[..., 0].astype(int), hsv[..., 1].astype(int), hsv[..., 2].astype(int)
+    gold = (H >= 22) & (H <= 48) & (S >= 110) & (V >= 150)
+    x0, x1 = max(0, x - 4 - _GOLD_LEFT_LOOKBACK), max(0, x - 4)
+    y0, y1 = max(0, y - _GOLD_LEFT_VPAD), min(gold.shape[0], y + h + _GOLD_LEFT_VPAD)
+    if x1 <= x0 or y1 <= y0:
+        return 0
+    return int(gold[y0:y1, x0:x1].sum())
+
+
+def find_meso_candidate_verified(
+    boxes: list[tuple[int, int, int, int, str]],
+    frame_rgb,
+    frame_size: tuple[int, int],
+) -> tuple[int, int, int, int, int] | None:
+    """find_meso_candidate plus the coin-icon check (module note above).
+
+    Same candidate filtering/order; the first candidate with the coin icon to
+    its left wins. None when nothing qualifies (inventory closed) or no
+    candidate has a coin to its left. Manual mode keeps using
+    find_meso_in_region -- the user already scoped that region to the counter.
+    """
+    fw, fh = frame_size
+    candidates: list[tuple[int, int, str, int, int, int, int]] = []
+    for x, y, w, h, text in boxes:
+        stripped = text.strip()
+        if not _MESO_PURE_DIGIT_RE.match(stripped):
+            continue
+        if y + h > fh - _STAT_STRIP_MARGIN:
+            continue  # stat-panel strip: LV/HP/MP/EXP live here
+        digits = stripped.replace(",", "")
+        if not digits:
+            continue
+        if int(digits) > _MESO_MAX:
+            continue
+        candidates.append((len(digits), y, stripped, x, y, w, h))
+    candidates.sort(key=lambda c: (c[0], c[1]))
+    for _, _, text, x, y, w, h in candidates:
+        if _count_gold_left_of(frame_rgb, x, y, w, h) >= _GOLD_MIN_PX:
+            value = parse_meso(text)
+            if value is not None:
+                return x, y, w, h, value
+    return None
+
+
 def find_stat_fields(
     boxes: list[tuple[int, int, int, int, str]],
 ) -> dict[str, tuple[int, int, int, int]]:

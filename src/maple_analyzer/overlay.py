@@ -54,7 +54,7 @@ from PIL import Image
 from . import __version__
 from .i18n import Lang, t
 from .ocr import StatPanelOcr
-from .parser import StatSnapshot, find_meso_candidate, find_meso_from_boxes, find_meso_in_region, find_stat_fields, parse_fields, parse_meso
+from .parser import StatSnapshot, find_meso_candidate_verified, find_meso_in_region, find_stat_fields, parse_fields, parse_meso
 from .rate import Session, SessionSummary
 from .regions import QUICK_BAR_FRAC
 from .region_selector import RegionSelector
@@ -1944,7 +1944,7 @@ class OverlayApp:
                     frame = self._source.grab_full()
                 boxes = locate_ocr.detect_text(frame)
                 stat = find_stat_fields(boxes)
-                meso_found = find_meso_candidate(boxes, frame.size)
+                meso_found = find_meso_candidate_verified(boxes, frame, frame.size)
                 fw, fh = frame.size
                 stat_frac = {
                     name: (x / fw, y / fh, w / fw, h / fh)
@@ -1985,7 +1985,7 @@ class OverlayApp:
                 frame = self._source.grab_full()
             boxes = self._ocr.detect_text(frame)
             stat = find_stat_fields(boxes)
-            meso_found = find_meso_candidate(boxes, frame.size) if self._settings.track_meso else None
+            meso_found = find_meso_candidate_verified(boxes, frame, frame.size) if self._settings.track_meso else None
             fw, fh = frame.size
             stat_frac = {
                 name: (x / fw, y / fh, w / fw, h / fh)
@@ -2478,7 +2478,8 @@ class OverlayApp:
                     return value
             frame = self._active_source().grab_full()
             boxes = self._ocr.detect_text(frame)
-            return find_meso_from_boxes(boxes, frame.size)
+            found = find_meso_candidate_verified(boxes, frame, frame.size)
+            return found[4] if found is not None else None
         except Exception:
             return None
 

@@ -14,7 +14,15 @@ from pathlib import Path
 import pytest
 from PIL import Image, ImageDraw, ImageFont
 
-from maple_analyzer.parser import find_meso_candidate, find_meso_from_boxes, find_meso_in_region, find_stat_fields
+from maple_analyzer.parser import (
+    _GOLD_MIN_PX,
+    _count_gold_left_of,
+    find_meso_candidate,
+    find_meso_candidate_verified,
+    find_meso_from_boxes,
+    find_meso_in_region,
+    find_stat_fields,
+)
 
 _DEJAVU = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
 _BG = (10, 12, 18)
@@ -197,3 +205,64 @@ def test_find_meso_in_region_ignores_non_digit_text():
 
 def test_find_meso_in_region_returns_none_when_empty():
     assert find_meso_in_region([]) is None
+
+
+# ---- coin-icon verification (method A, 2026-09-06) ------------------------
+
+_COIN = (230, 180, 50)  # golden-yellow, inside the _count_gold_left_of mask
+
+
+def _frame_with_coin(coin_x: int = 60, coin_y: int = 60) -> Image.Image:
+    """Dark frame with a drawn golden coin at the given position."""
+    img = Image.new("RGB", (600, 200), _BG)
+    d = ImageDraw.Draw(img)
+    d.ellipse((coin_x, coin_y, coin_x + 30, coin_y + 30), fill=_COIN)
+    return img
+
+
+def test_gold_left_count():
+    img = _frame_with_coin(coin_x=60, coin_y=60)  # coin spans x 60-90, y 60-90
+    # Box at x=150: lookbehind window is x 56..146, y 48..113 -> covers the coin.
+    assert _count_gold_left_of(img, 150, 60, 75, 21) >= _GOLD_MIN_PX
+    # Box far to the right: window never reaches the coin.
+    assert _count_gold_left_of(img, 500, 60, 75, 21) == 0
+
+
+def test_gold_verify_rejects_number_without_coin():
+    """A stray larger number (chat / damage / other window) has no coin icon
+    to its left -> must NOT be accepted as meso."""
+    img = _frame_with_coin(coin_x=400, coin_y=150)  # coin far from everything
+    boxes = [(100, 80, 100, 21, "999999999")]
+    assert find_meso_candidate_verified(boxes, img, img.size) is None
+
+
+def test_gold_verify_accepts_real_meso():
+    img = _frame_with_coin()  # coin at x 60-90
+    boxes = [(150, 80, 75, 21, "1,371,339")]
+    found = find_meso_candidate_verified(boxes, img, img.size)
+    assert found is not None
+    assert found[4] == 1_371_339
+
+
+def test_gold_verify_prefers_verified_over_larger():
+    """The old logic would have picked the 9-digit blob. With verification the
+    larger digit-less-coin number is rejected and the coin-backed meso wins."""
+    img = _frame_with_coin()  # coin at x 60-90 (left of the meso box)
+    boxes = [
+        (400, 80, 100, 21, "999999999"),   # bigger, but no coin to its left
+        (150, 80, 75, 21, "1,371,339"),    # the real meso counter
+    ]
+    found = find_meso_candidate_verified(boxes, img, img.size)
+    assert found is not None
+    assert found[4] == 1_371_339
+
+
+def test_gold_verify_all_rejected_returns_none():
+    """Several pure-digit blobs but none backed by a coin -> None (inventory
+    closed is the realistic case: no coin, no counter)."""
+    img = _frame_with_coin(coin_x=450, coin_y=150)
+    boxes = [
+        (100, 60, 100, 21, "1234567"),
+        (250, 80, 75, 21, "888"),
+    ]
+    assert find_meso_candidate_verified(boxes, img, img.size) is None
