@@ -43,6 +43,10 @@ _EXP_CUR_RE = re.compile(r"EXP\D{0,3}(\d+)\s*[\[({]", re.IGNORECASE)
 # adjacent OCR noise.
 _EXP_PCT_RE = re.compile(r"(\d{1,2}[\s.:]+\d{1,2}|\d{3,4})\s*%")
 _LV_RE = re.compile(r"LV\.?\D{0,3}(\d+)", re.IGNORECASE)
+# How far to the right of a bare 'LV.' detection label to widen the field
+# box so the per-tick recognition read covers the level digits (see the
+# label-only fallback in find_stat_fields, 2026-09-06).
+_LV_LABEL_EXTEND_PX = 110
 
 # Detection-text patterns for locating the stat panel fields in a full-frame
 # detection pass (see find_stat_fields) -- the same regexes the per-field
@@ -350,4 +354,19 @@ def find_stat_fields(
                 break
             if "LV" in found:
                 break
+    # LV label-only fallback (2026-09-06): on the native 1366x768 client the
+    # digit is sometimes NOT detected at all -- the frame yields a bare 'LV.'
+    # label box (seen on samples/maple_story_ui_20260906_c.png, and it made
+    # the LV field vanish from every tick for minutes in the log while EXP
+    # kept reading). No digit box exists to merge, so widen the label box to
+    # the right to cover where the digits sit; the per-tick recognition OCR
+    # then reads the whole 'LV. 44' and parses normally. 110px covers the
+    # digits at 1366-2045px client widths without reaching the HP field.
+    if "LV" not in found:
+        for x, y, w, h, text in boxes:
+            stripped = text.strip()
+            if not re.match(r"^LV\.?$", stripped, re.IGNORECASE):
+                continue
+            found["LV"] = (int(x), int(y), int(w) + _LV_LABEL_EXTEND_PX, int(h))
+            break
     return found

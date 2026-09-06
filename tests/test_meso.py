@@ -152,6 +152,23 @@ def test_find_stat_fields_merges_split_lv():
     assert y <= 831 and y + h >= 858
 
 
+def test_find_stat_fields_lv_label_only_fallback():
+    """Detection reads a bare 'LV.' label with NO digit box at all (seen on
+    the native 1366x768 client, 2026-09-06) -- the label box is widened to
+    the right so the tick's recognition OCR still covers the level digits."""
+    boxes = [
+        (288, 777, 43, 21, "LV."),
+        (721, 770, 106, 16, "EXP 153914[35 94%]"),
+    ]
+    found = find_stat_fields(boxes)
+    assert "LV" in found
+    x, y, w, h = found["LV"]
+    # Label box widened rightward to swallow the digits.
+    assert (x, y, h) == (288, 777, 21)
+    assert w > 100
+    assert "EXP" in found
+
+
 # ---- end-to-end through the real OCR engine ------------------------------
 
 def _game_like_frame():

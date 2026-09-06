@@ -1803,6 +1803,7 @@ class OverlayApp:
         if not (s.hp_quick_slot_index or s.mp_quick_slot_index):
             return
         counts = self._read_slot_counts()
+        self._log(f"[{time.strftime('%H:%M:%S')}] quickbar slots={counts}")
         if s.hp_quick_slot_index in counts:
             self._last_hp_slot_count = counts[s.hp_quick_slot_index]
         if s.mp_quick_slot_index in counts:
@@ -1828,6 +1829,7 @@ class OverlayApp:
             self._session.record_potion("hp", counts[s.hp_quick_slot_index])
         if s.mp_quick_slot_index in counts:
             self._session.record_potion("mp", counts[s.mp_quick_slot_index])
+        self._log(f"[{time.strftime('%H:%M:%S')}] quickbar slots={counts}")
         self._render(self._last)
 
     def _select_region(self, callback, title_key: str) -> None:
