@@ -386,6 +386,9 @@ class Session:
         self._last_exp: int | None = None
         self._last_level: int | None = None
         self._last_implied_total: float | None = None  # see _exp_reading_is_trusted
+        # Pending level-up reset, [prev_level_total, segment_start, low_count]
+        # -- see _record_exp's level-up detection (2026-09-07).
+        self._reset_candidate: list | None = None
 
         # Calibration state -- see the class docstring. Inert (never
         # consulted) when require_calibration is False.
@@ -458,6 +461,7 @@ class Session:
         self._banked = 0
         self._segment_start = self._exp_cur
         self._last_exp = self._exp_cur
+        self._reset_candidate = None
         self._paused = False
         self._pause_started_at = None
         self._paused_total = 0.0
@@ -766,24 +770,49 @@ class Session:
         if self._segment_start is None:
             self._segment_start = exp_cur
 
-        levelled = (
+        # Level-up detection (2026-09-07). The LV field and the EXP field OCR
+        # at different moments, so a real level-up rarely shows both changes
+        # in the SAME frame (observed live: level still read 45 while EXP had
+        # already reset to 32). Requiring the old level-jump + EXP-drop pair
+        # in one frame meant the reset frame was classified as a misread, the
+        # segment never banked, and exp_diff sat at 0 forever -- the reported
+        # "EXP 歸零後就停住" bug. Now an EXP value far below the established
+        # level total ARMS a candidate; it confirms on a second low frame OR
+        # when the level actually jumps. A misread recovers high the next
+        # frame and cancels (that protection is test_exp_drop_without_a_level_
+        # change_is_ignored).
+        level_jumped = (
             level is not None
             and self._last_level is not None
             and level > self._last_level
-            and self._last_exp is not None
-            and exp_cur < self._last_exp
         )
-        if levelled:
-            # Bank the level just finished, then start the new segment at 0 --
-            # whatever is already banked into the new level counts as gain.
-            # Requiring *both* a level increase and an EXP reset keeps a
-            # one-off level misread from banking a phantom segment.
-            if previous_total:
-                self._banked += max(0, int(previous_total - self._segment_start))
-            # Without a percentage reading the finished level's total is
-            # unknown, so its remainder is dropped rather than invented: an
-            # under-count, never a fabricated number.
+        if self._reset_candidate is None:
+            # Arms only on a DROP into the low band (exp < last reading AND
+            # far below the level total) -- steady low-level grinding at the
+            # start of a level never drops, so it must not arm. previous_total
+            # here is the level total from the last frame (before this frame
+            # re-derives it from the reset value).
+            if (
+                previous_total
+                and self._last_exp is not None
+                and exp_cur < self._last_exp
+                and exp_cur < previous_total * 0.15
+            ):
+                self._reset_candidate = [previous_total, self._segment_start, 1]
+        else:
+            cand_total, _cand_seg_start, _count = self._reset_candidate
+            if exp_cur < cand_total * 0.15:
+                self._reset_candidate[2] += 1
+            else:
+                self._reset_candidate = None  # recovered high: it was a misread
+        if self._reset_candidate is not None and (
+            self._reset_candidate[2] >= 2 or level_jumped
+        ):
+            cand_total, cand_seg_start, _ = self._reset_candidate
+            if cand_total:
+                self._banked += max(0, int(cand_total - (cand_seg_start or 0)))
             self._segment_start = 0
+            self._reset_candidate = None
 
         self._last_exp = exp_cur
         self._exp_cur = exp_cur

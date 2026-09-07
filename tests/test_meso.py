@@ -283,3 +283,19 @@ def test_gold_verify_all_rejected_returns_none():
         (250, 80, 75, 21, "888"),
     ]
     assert find_meso_candidate_verified(boxes, img, img.size) is None
+
+
+def test_gold_verify_zero_reading_is_not_trusted():
+    """A coin-backed '0' must not overwrite a real balance with 0 (reported
+    2026-09-07: the HUD/confirm dialog showed 0 for a player with meso --
+    an OCR glitch that seeded a bogus baseline). Skip it; the previous
+    reading stands until a sane one arrives."""
+    img = _frame_with_coin()  # coin at x 60-90, box right of it
+    boxes = [(150, 80, 30, 21, "0")]
+    assert find_meso_candidate_verified(boxes, img, img.size) is None
+    # The zero must not shadow a real balance read in the same pass either:
+    # candidates are tried most-digits first, and a large non-zero backed by
+    # the coin wins over the zero.
+    boxes = [(220, 80, 30, 21, "0"), (160, 80, 75, 21, "523,000")]
+    found = find_meso_candidate_verified(boxes, img, img.size)
+    assert found is not None and found[4] == 523_000

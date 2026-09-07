@@ -303,8 +303,17 @@ def find_meso_candidate_verified(
     for _, _, text, x, y, w, h in candidates:
         if _count_gold_left_of(frame_rgb, x, y, w, h) >= _GOLD_MIN_PX:
             value = parse_meso(text)
-            if value is not None:
-                return x, y, w, h, value
+            if value is None:
+                continue
+            if value == 0:
+                # A coin-backed zero is order-of-magnitude wrong for any
+                # player with actual meso (the classic counter renders the
+                # real balance, not '0', except when genuinely broke). An OCR
+                # glitch flashing 0 would wipe the HUD/confirm-dialog balance
+                # and seed a bogus session baseline (reported 2026-09-07), so
+                # skip the reading and keep the previous value.
+                continue
+            return x, y, w, h, value
     return None
 
 

@@ -80,6 +80,47 @@ def test_exp_drop_without_a_level_change_is_ignored():
     assert s.exp_diff == 100
 
 
+def test_level_up_when_level_field_arrives_a_frame_late():
+    """The reported bug (2026-09-07): the LV and EXP fields OCR at different
+    moments, so a real level-up usually does NOT show the level jump in the
+    same frame as the EXP reset. Previously the frame 'level 45 + EXP 32' was
+    classified as a misread (EXP dropped, level unchanged), the segment never
+    banked, and exp_diff stuck at 0 forever even as the player kept grinding.
+    The reset must be recognised on its own (low value after a high one),
+    with the late level jump acting as extra corroboration."""
+    s = Session(require_calibration=False)
+    s.start()
+    _record(s, exp=380_000, pct=88.72, level=45)     # total ~428,265
+    _record(s, exp=428_194, pct=99.98, level=45)
+    _record(s, exp=32, pct=0.01, level=45)           # EXP reset, LV not caught up yet
+    _record(s, exp=35, pct=0.01, level=45)           # still low next frame -> confirmed
+    assert s.exp_diff is not None
+    assert s.exp_diff > 48_000                       # the level was banked
+    # LV finally shows the jump; EXP climbs steadily out of the low band
+    # (frames must rise gradually -- pct is 2dp-rounded, so just after a
+    # level-up the implied level total wobbles and a big jump reads as a
+    # misread and is rejected, exactly like real OCR noise).
+    _record(s, exp=100, pct=0.023, level=46)
+    _record(s, exp=300, pct=0.07, level=46)
+    _record(s, exp=1_200, pct=0.28, level=46)
+    assert s.exp_diff is not None
+    assert abs(s.exp_diff - ((LV44_TOTAL - 380_000) + 1_200)) < 2
+
+
+def test_level_up_detected_even_when_level_never_reads():
+    """LV field unreadable for a while (OCR miss): two consecutive low EXP
+    readings after the reset confirm the level-up on their own."""
+    s = Session(require_calibration=False)
+    s.start()
+    _record(s, exp=100_000, pct=23.4, level=45)      # level started ~427,350 total
+    _record(s, exp=428_194, pct=99.98, level=45)
+    _record(s, exp=32, pct=0.01, level=None)         # reset, no level this frame
+    _record(s, exp=40, pct=0.01, level=None)         # second low frame confirms
+    assert s.exp_diff is not None
+    assert s.exp_diff > 328_000
+    assert s.exp_diff < 328_400
+
+
 def test_level_is_optional_and_old_behaviour_holds_without_it():
     """record() is called without a level by existing tests and by any caller
     that doesn't parse one; a plain monotonic gain must still work."""

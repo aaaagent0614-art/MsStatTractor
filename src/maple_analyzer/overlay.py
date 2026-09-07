@@ -2403,6 +2403,9 @@ class OverlayApp:
             self._meso_box = meso_frac
             if meso_value is not None:
                 self._last_meso = meso_value
+                self._log(
+                    f"[{time.strftime('%H:%M:%S')}] meso locate value={meso_value:,}"
+                )
             if self._run_state == "running" and meso_value is not None:
                 self._session.record_meso(meso_value)
                 self._render(self._last)  # show the updated meso rows promptly
@@ -2433,6 +2436,9 @@ class OverlayApp:
             value = parse_meso(text)
             if value is not None:
                 self._last_meso = value
+                self._log(
+                    f"[{time.strftime('%H:%M:%S')}] meso manual value={value:,}"
+                )
                 self._session.record_meso(value)
                 self._render(self._last)
         except Exception:
