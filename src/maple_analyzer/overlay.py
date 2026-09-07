@@ -1761,16 +1761,35 @@ class OverlayApp:
         l, t, r, b = QUICK_BAR_FRAC
         return frame.crop((int(l * w), int(t * h), int(r * w), int(b * h)))
 
-    def _read_slot_counts(self) -> dict[int, int]:
+    def _save_quickbar_debug(self, img=None, scale: int = 1, boxes=None) -> None:
+        """Dump the quickbar crop + OCR boxes next to the app so a failing
+        potion read can be diagnosed from the image instead of guesswork
+        (v1.9.3 diagnostic; remove once the misread is fixed)."""
+        try:
+            if img is not None:
+                img.save("quickbar_debug.png")
+            with open("quickbar_debug.txt", "w", encoding="utf-8") as f:
+                f.write(f"scale={scale}\n")
+                if img is not None:
+                    f.write(f"size={img.width}x{img.height}\n")
+                f.write(f"boxes={boxes!r}\n")
+        except Exception:
+            pass
+
+    def _read_slot_counts(self, debug_out: bool = False) -> dict[int, int]:
         """Detect the potion count in each of the 8 quickbar slots, returning
         {slot_index: count} for slots whose count was read. Detection (not
         recognition-only) is used because the count sits at a variable spot
         inside each slot; the small region keeps it cheap. The count is
         assigned to its slot by the key labels above each slot
         (_quickbar_slots_from_boxes) -- equal division landed counts in the
-        wrong slot because the crop includes blank margins (2026-09-06)."""
+        wrong slot because the crop includes blank margins (2026-09-06).
+        debug_out saves the crop + boxes so a total miss ({}) can be looked
+        at instead of guessed at (2026-09-07)."""
         img = self._grab_quick_bar_image()
         if img is None:
+            if debug_out:
+                self._save_quickbar_debug()
             return {}
         # Tiny native-resolution quickbars read badly at 1x -- upscale small
         # crops before detection (LANCZOS, cheap on a <300px-wide region).
@@ -1793,6 +1812,8 @@ class OverlayApp:
                 for x, y, bw, bh, text in boxes
             ]
             w, h = w // scale, h // scale
+        if debug_out:
+            self._save_quickbar_debug(img, scale, boxes)
         return _quickbar_slots_from_boxes(boxes, w, h)
 
     def _scan_quick_slots_to_last(self) -> None:
@@ -1802,7 +1823,7 @@ class OverlayApp:
         s = self._settings
         if not (s.hp_quick_slot_index or s.mp_quick_slot_index):
             return
-        counts = self._read_slot_counts()
+        counts = self._read_slot_counts(debug_out=True)
         self._log(f"[{time.strftime('%H:%M:%S')}] quickbar slots={counts}")
         if s.hp_quick_slot_index in counts:
             self._last_hp_slot_count = counts[s.hp_quick_slot_index]
