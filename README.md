@@ -8,10 +8,12 @@
 
 ## 下載與安裝
 
-1. 到 GitHub Release 頁面下載最新版：
-   `https://github.com/aaaagent0614-art/MsStatTractor/releases`
-2. 解壓縮 `MsStatTractor-版本號.zip`，得到一個 `MsStatTractor` 資料夾。
-3. 雙擊裡面的 `MsStatTractor.exe` 即可，**不需要安裝 Python 或任何東西**。
+**⬇️ [直接下載最新版（MsStatTractor-latest.zip）](https://github.com/aaaagent0614-art/MsStatTractor/releases/latest/download/MsStatTractor-latest.zip)**
+
+或點這裡看 [GitHub Release 頁面](https://github.com/aaaagent0614-art/MsStatTractor/releases/latest)（所有版本、更新紀錄）。
+
+1. 解壓縮下載的 zip，得到一個 `MsStatTractor` 資料夾。
+2. 雙擊裡面的 `MsStatTractor.exe` 即可，**不需要安裝 Python 或任何東西**。
 
 > 資料夾要**保持完整**（執行檔需要旁邊的檔案才能運作），可以整個放到任何位置，例如 `桌面\MsStatTractor`。
 

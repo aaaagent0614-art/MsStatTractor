@@ -41,18 +41,25 @@ jobs:
           # (MsStatTractor-1.2.0-beta.zip from tag v1.2.0-beta)
           $tag = "${{ github.ref_name }}".TrimStart("v")
           "zip=MsStatTractor-$tag.zip" >> $env:GITHUB_OUTPUT
+          # Fixed-name twin (same build, version-free name) so the README's
+          # "always the latest" direct link keeps working across releases:
+          # .../releases/latest/download/MsStatTractor-latest.zip
+          "latest=MsStatTractor-latest.zip" >> $env:GITHUB_OUTPUT
 
       - name: Package zip
         shell: pwsh
         run: |
           Compress-Archive -Path dist/MsStatTractor -DestinationPath "${{ steps.asset.outputs.zip }}" -Force
-          Get-Item "${{ steps.asset.outputs.zip }}" | Select-Object Name, Length
+          Copy-Item "${{ steps.asset.outputs.zip }}" "${{ steps.asset.outputs.latest }}" -Force
+          Get-Item "${{ steps.asset.outputs.zip }}", "${{ steps.asset.outputs.latest }}" | Select-Object Name, Length
 
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.asset.outputs.zip }}
+          files: |
+            ${{ steps.asset.outputs.zip }}
+            ${{ steps.asset.outputs.latest }}
           prerelease: ${{ contains(github.ref_name, 'beta') }}
           fail_on_unmatched_files: false
           # Release body 固定模板：沿用 v1.1.1 的寫法格式（## 章節標題、
