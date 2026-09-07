@@ -189,6 +189,7 @@ QUICK_SLOT_COUNT = 8
 # assigned one slot left of the real one, 2026-09-06).
 _QUICK_KEY_TEXT = {
     "shift": "Shift", "shit": "Shift", "shif": "Shift", "shft": "Shift", "sft": "Shift",
+    "shirt": "Shift", "sh1ft": "Shift",
     "ins": "Ins", "lns": "Ins", "ims": "Ins", "insl": "Ins",
     "home": "Home", "hom": "Home", "hm": "Home", "hme": "Home", "hone": "Home",
     "pgup": "PgUp", "pgu": "PgUp", "pup": "PgUp", "pg": "PgUp",
@@ -212,8 +213,28 @@ def _match_quick_key(text: str) -> str | None:
     return None
 
 
-def _pure_digits(text: str) -> bool:
-    return bool(text.strip()) and all(ch in "0123456789," for ch in text.strip())
+_COUNT_TRAILING = ".,:;'`\"|"
+
+
+def _quick_count_text(text: str) -> str | None:
+    """Return the clean digit run when `text` is a quickbar count OCR blob.
+
+    Slot counts are short pure-digit strings ('320') but the slot border
+    can glue one junk char onto the last digit ('156.' measured on
+    2026-09-07 real capture), which the strict _pure_digits filter used to
+    drop -- so HP counts sitting low in their slot were never read.
+    Accepts digits with optional thousands commas plus at most ONE trailing
+    separator char. Rejects anything with letters, '%', or long text (key
+    labels, bottom-toolbar readouts like 'S54%' must not become counts).
+    """
+    t = text.strip()
+    if not t or len(t) > 12:
+        return None
+    if t[-1] in _COUNT_TRAILING:
+        t = t[:-1]
+    if not t or not all(ch in "0123456789," for ch in t):
+        return None
+    return t
 
 
 def _quickbar_slots_from_boxes(
@@ -235,7 +256,7 @@ def _quickbar_slots_from_boxes(
         k = _match_quick_key(text)
         if k:
             keys.append((k, x, y, bw, bh))
-        elif _pure_digits(text):
+        elif _quick_count_text(text) is not None:
             digs.append((text, x, y, bw, bh))
 
     # Row geometry: key labels of the top row sit at the same y; the bottom
@@ -1803,6 +1824,10 @@ class OverlayApp:
             boxes = self._ocr.detect_text(img)
         except Exception:
             return {}
+        if debug_out:
+            # Save the crop + boxes at the SAME scale (both pre-downscale)
+            # so the dump matches the image pixel-for-pixel when diagnosing.
+            self._save_quickbar_debug(img, scale, boxes)
         w, h = img.size
         if w <= 0 or h <= 0:
             return {}
@@ -1812,8 +1837,6 @@ class OverlayApp:
                 for x, y, bw, bh, text in boxes
             ]
             w, h = w // scale, h // scale
-        if debug_out:
-            self._save_quickbar_debug(img, scale, boxes)
         return _quickbar_slots_from_boxes(boxes, w, h)
 
     def _scan_quick_slots_to_last(self) -> None:

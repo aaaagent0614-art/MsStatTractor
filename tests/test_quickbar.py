@@ -20,6 +20,7 @@ def test_match_quick_key_exact():
 
 def test_match_quick_key_ocr_variants():
     assert _match_quick_key("Shit") == "Shift"
+    assert _match_quick_key("Shirt") == "Shift"  # measured 2026-09-07 real capture
     assert _match_quick_key("Pup") == "PgUp"
     assert _match_quick_key("Hm") == "Home"
     assert _match_quick_key("Dell") == "Del"
@@ -75,6 +76,40 @@ def test_non_digit_labels_never_become_counts():
     boxes = _a_style_boxes() + [(0, 206, 20, 12, "S54%")]
     result = _quickbar_slots_from_boxes(boxes, 627, 227)
     assert 54 not in result.values()
+
+
+def test_trailing_dot_on_count_still_reads():
+    """Real captures glue the slot border onto the count ('181.'), which the
+    strict pure-digit filter used to drop -- HP counts sitting low in their
+    slot were never read (measured 2026-09-07). One trailing junk char is
+    tolerated; parse_meso then extracts the digit run."""
+    boxes = _a_style_boxes()
+    boxes = [(x, y, w, h, "181." if t == "181" else t) for x, y, w, h, t in boxes]
+    result = _quickbar_slots_from_boxes(boxes, 627, 227)
+    assert result.get(4) == 181
+    assert result.get(8) == 1056
+
+
+def test_real_capture_20260907_debug_boxes():
+    """Regression from the 2026-09-07 real capture (quickbar_debug.png):
+    PgUp count OCR'd as '156.' (trailing dot glued from the slot border),
+    PgDn as '320', Shift misread as 'Shirt'. Both counts must land in the
+    right slots; the counts are the HP/MP potion rows."""
+    boxes = [
+        (121, 31, 27, 11, "Shirt"),  # top row slot 1 (Shift) misread
+        (155, 32, 17, 10, "Ins"),
+        (190, 31, 18, 10, "Hm"),     # Home
+        (223, 29, 22, 14, "PuP"),    # PgUp
+        (223, 48, 25, 12, "156."),   # HP count, trailing dot
+        (156, 65, 18, 9, "Del"),
+        (191, 65, 18, 9, "End"),
+        (123, 69, 22, 22, "r"),      # Ctrl misread -- not a key, not a count
+        (223, 81, 25, 12, "320"),    # MP count
+    ]
+    result = _quickbar_slots_from_boxes(boxes, 874, 244)
+    assert result.get(4) == 156
+    assert result.get(8) == 320
+    assert 5 not in result
 
 
 def test_fallback_equal_division_when_no_key_labels():
