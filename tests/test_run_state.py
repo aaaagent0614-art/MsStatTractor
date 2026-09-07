@@ -129,6 +129,12 @@ class _StubApp:
         # locator thread; _do_tick reads _stat_boxes and calls _try_locate.
         self._stat_boxes = None
         self._meso_box = None
+        self._consecutive_fail_ticks = 0
+        self._auto_meso_misses = 0
+        self._force_locate = False
+        self._last_locate_attempt = 0.0
+        self._last_locate_client_size: tuple[int, int] | None = None
+        self._meso_scan_ticks = 0
 
         self._status_pill = _StubWidget()
         self._timer_label = _StubWidget()
@@ -192,6 +198,8 @@ class _StubApp:
     _update_timer_label = OverlayApp._update_timer_label
     _maybe_finalize_on_timeout = OverlayApp._maybe_finalize_on_timeout
     _maybe_refresh_manual_meso = OverlayApp._maybe_refresh_manual_meso
+    _maybe_scan_auto_meso = OverlayApp._maybe_scan_auto_meso
+    _want_relocate = OverlayApp._want_relocate
     _commit_session_to_history = OverlayApp._commit_session_to_history
     _finalize_and_maybe_stop = OverlayApp._finalize_and_maybe_stop
     _start_session_with_current_values = OverlayApp._start_session_with_current_values
@@ -576,3 +584,32 @@ def test_start_confirmed_baseline_seeds_session(monkeypatch):
     app._session.record_potion("hp", 25)
     assert app._session.meso_gained == 5_433
     assert app._session.hp_potion_consumed == 5
+
+
+# --- demand-driven background locator (2026-09-07) -------------------------
+
+
+def test_want_relocate_is_demand_driven():
+    """The full-frame detection pass must NOT run on a fixed cadence while
+    grinding is healthy -- it now runs only when the cached boxes stop
+    working (user request 2026-09-07: positions don't move while grinding)."""
+    app = _StubApp()
+
+    # Never located yet -> relocate (fixed reference boxes are a fallback).
+    assert app._want_relocate() is True
+
+    # Located and reading fine -> no relocation during steady grinding.
+    app._stat_boxes = {"LV": (0.1, 0.9, 0.2, 0.02), "EXP": (0.1, 0.95, 0.2, 0.02)}
+    app._last_locate_client_size = (1366, 768)
+    app._consecutive_fail_ticks = 0
+    assert app._want_relocate() is False
+
+    # Panel went unreadable for RELOCATE_AFTER_FAILS consecutive ticks.
+    app._consecutive_fail_ticks = overlay_module.RELOCATE_AFTER_FAILS
+    assert app._want_relocate() is True
+
+    # A settings change forces one relocate even while healthy.
+    app._consecutive_fail_ticks = 0
+    app._force_locate = True
+    assert app._want_relocate() is True
+    assert app._force_locate is False  # consumed

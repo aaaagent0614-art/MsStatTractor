@@ -157,13 +157,19 @@ TARGET_MS = 500  # target full tick cycle -- 2Hz
 # HUD only keeps the live OCR readouts fresh -- so a 1Hz cycle is plenty and
 # halves the idle CPU/GPU load (see _do_tick's return).
 TARGET_MS_IDLE = 1000
-# Background locator cadence. Each pass runs full-frame *detection* OCR
-# (~600ms+) in a daemon thread to re-find the stat panel fields and the
-# meso counter, so the tick thread only ever does cheap recognition reads
-# on cached boxes. Every 10 ticks = ~5s at 2Hz. Also what makes the HUD
-# survive screen magnifiers (Megapipe): the detected positions track the
-# rescaled layout every pass.
-LOCATE_INTERVAL_TICKS = 10
+# Background locator policy (2026-09-07): the tick thread only ever does
+# cheap recognition reads on cached boxes; the full-frame detection pass
+# (~600ms+, own OCR engine, own capture) is what re-finds the stat panel +
+# meso counter. It used to run every LOCATE_INTERVAL_TICKS unconditionally;
+# steady grinding never moves the panel, so that pass was pure waste (user
+# request). Now the locator runs on DEMAND: when never located yet, when the
+# client resizes, when a settings change forces it, or after
+# RELOCATE_AFTER_FAILS consecutive ticks where neither LV nor EXP parsed
+# (panel moved/covered/magnifier changed). RELOCATE_MIN_INTERVAL_S rate-
+# limits retries so a persistently broken read retries ~every 4s, not every
+# tick.
+RELOCATE_AFTER_FAILS = 6
+RELOCATE_MIN_INTERVAL_S = 4.0
 # How often (in ticks) manual mode re-reads the meso counter via cheap
 # recognition-only OCR on the marked meso region (~15ms) -- no detection, so
 # no CPU spike like the locator's periodic detection pass used to cause.
@@ -524,12 +530,15 @@ class OverlayApp:
         # Background locator state (see _try_locate / _apply_locate). A
         # daemon thread periodically runs full-frame detection to find the
         # stat panel fields AND the meso counter, caching their positions
-        # so the tick thread only does cheap recognition reads. This is what
-        # keeps the HUD correct under screen magnifiers (Megapipe): the
-        # detected positions track the magnified layout every pass.
-        self._locate_ticks = 0
+        # so the tick thread only does cheap recognition reads. Demand-driven
+        # since 2026-09-07: steady grinding never relocates; see the
+        # RELOCATE_* constants above.
         self._locate_thread: threading.Thread | None = None
         self._locate_ocr: StatPanelOcr | None = None
+        self._force_locate = False  # settings change -> relocate next tick
+        self._last_locate_attempt = 0.0
+        self._last_locate_client_size: tuple[int, int] | None = None
+        self._consecutive_fail_ticks = 0
         # Detected stat-field boxes as fractions of the client frame:
         # {'LV': (fx, fy, fw, fh), ...}. None until the locator has found
         # the panel (tick falls back to regions.FIELD_BOXES meanwhile).
@@ -543,6 +552,7 @@ class OverlayApp:
         self._manual_source = None
         self._manual_calibrated = False
         self._meso_scan_ticks = 0
+        self._auto_meso_misses = 0  # stale auto meso box -> force relocate
         # Update-check state (see _check_for_updates): the latest release tag
         # when a newer version is available, else None.
         self._update_available: str | None = None
@@ -1569,7 +1579,9 @@ class OverlayApp:
             # Restore the persisted last-known-good auto positions (may be None
             # on first run -> falls back to regions.FIELD_BOXES until detected).
             self._stat_boxes = s.auto_stat_frac
-        self._locate_ticks = LOCATE_INTERVAL_TICKS
+        # Settings changed the capture/geometry: force a relocate on the next
+        # tick regardless of the demand heuristics.
+        self._force_locate = True
 
     def _active_source(self):
         """The capture source for this tick/locate pass: the manual screen
@@ -2024,6 +2036,16 @@ class OverlayApp:
         field_images = {k: v for k, v in field_images.items() if k in ("LV", "EXP")}
         field_text = {name: self._ocr.read_field(img) for name, img in field_images.items()}
         snap = parse_fields(field_text)
+        # Locator demand signal: several consecutive ticks where neither LV
+        # nor EXP parsed means the panel moved out from under the cached
+        # boxes (window dragged / resized / magnifier changed / covered) --
+        # count the streak here; _want_relocate acts once it passes
+        # RELOCATE_AFTER_FAILS. A single-field miss (EXP OCR dip while LV
+        # reads fine) is normal noise and resets the counter.
+        parsed_ok = snap.level is not None or snap.exp_cur is not None
+        self._consecutive_fail_ticks = (
+            0 if parsed_ok else self._consecutive_fail_ticks + 1
+        )
         self._log(f"[{time.strftime('%H:%M:%S')}] fields={field_text}")
         self._log(f"          -> {snap}")
         # A single tick occasionally misses a field (combat effects/floating
@@ -2071,12 +2093,39 @@ class OverlayApp:
 
         self._render(merged)
         self._maybe_refresh_manual_meso()
+        self._maybe_scan_auto_meso()
         self._maybe_scan_quick_slot()
         # While stopped nothing is recorded -- throttle to 0.5Hz to keep idle
         # CPU near zero (see TARGET_MS_IDLE). Running/paused keep the 1Hz rate.
         target = TARGET_MS_IDLE if self._run_state == "stopped" else TARGET_MS
         elapsed_ms = (time.perf_counter() - t0) * 1000
         return max(0, int(target - elapsed_ms))
+
+    def _want_relocate(self) -> bool:
+        """Whether the background locator should run this tick (auto mode).
+
+        Demand-driven: False while the cached stat boxes keep reading fine
+        (steady grinding) -- the periodic full-frame pass was pure waste
+        (user request 2026-09-07). True when: never located yet (fixed
+        reference boxes are a fallback, not a real fix), the client resized
+        (panel moved under the boxes), a settings change forced it, or
+        RELOCATE_AFTER_FAILS consecutive ticks parsed neither LV nor EXP
+        (panel covered / moved / magnifier changed)."""
+        if not self._stat_boxes:
+            return True
+        if self._force_locate:
+            self._force_locate = False
+            return True
+        cs = getattr(self._active_source(), "client_size", None)
+        if (
+            cs
+            and self._last_locate_client_size is not None
+            and cs != self._last_locate_client_size
+        ):
+            return True
+        if self._consecutive_fail_ticks >= RELOCATE_AFTER_FAILS:
+            return True
+        return False
 
     def _try_locate(self) -> None:
         """Locate the stat panel + meso counter.
@@ -2090,19 +2139,24 @@ class OverlayApp:
         once (guarded by _manual_calibrated) so the ~600ms cost is paid a
         single time.
 
-        Auto mode: the original throttled background pass (unchanged), which
-        re-finds the panel on the full frame so reads stay correct under a
-        screen magnifier (Magpie).
+        Auto mode: a demand-driven background pass (since 2026-09-07) -- it
+        re-finds the panel only when the cached boxes stop working (never
+        located yet, client resized, forced by a settings change, or several
+        consecutive ticks where neither LV nor EXP parsed). Steady grinding
+        never triggers it, so the ~600ms full-frame detection cost is paid
+        only when something actually moved.
         """
         if self._settings.use_manual:
             if not self._manual_calibrated and self._settings.manual_stat_region is not None:
                 self._run_manual_detection()
             return
 
-        self._locate_ticks = getattr(self, "_locate_ticks", 0) + 1
-        if self._locate_ticks < LOCATE_INTERVAL_TICKS:
+        if not self._want_relocate():
             return
-        self._locate_ticks = 0
+        now = time.time()
+        if now - self._last_locate_attempt < RELOCATE_MIN_INTERVAL_S:
+            return  # rate-limited: a persistently broken read retries ~4s, not every tick
+        self._last_locate_attempt = now
         _thread = getattr(self, "_locate_thread", None)
         if _thread is not None and _thread.is_alive():
             return  # previous pass still running -- skip this round
@@ -2387,6 +2441,9 @@ class OverlayApp:
         """Main-thread half of the locator pass (see _try_locate)."""
         if stat_frac:
             self._stat_boxes = stat_frac
+            cs = getattr(self._active_source(), "client_size", None)
+            if cs is not None:
+                self._last_locate_client_size = tuple(cs)
             if not self._settings.use_manual:
                 # Persist the last-known-good auto positions so a restart (or
                 # a transient OCR miss) reuses the real detected boxes instead
@@ -2443,6 +2500,54 @@ class OverlayApp:
                 self._render(self._last)
         except Exception:
             pass
+
+    def _maybe_scan_auto_meso(self) -> None:
+        """Auto-mode meso read: cheap recognition-only OCR on the last
+        located meso box every MESO_SCAN_INTERVAL_TICKS (~15ms, no
+        detection). The locator became demand-driven (2026-09-07), so the
+        periodic full-frame passes no longer keep the counter fresh -- this
+        does, at recognition cost, while the box stays valid. When the box
+        goes stale (inventory dragged / zoom changed), a few misses force
+        one relocate to re-find it (a relocate also re-syncs the stat
+        boxes, harmless)."""
+        s = self._settings
+        if s.use_manual or not s.track_meso or self._run_state != "running":
+            return
+        if self._meso_box is None:
+            return  # never located; the start-confirm 重新偵測 establishes it
+        self._meso_scan_ticks += 1
+        if self._meso_scan_ticks < MESO_SCAN_INTERVAL_TICKS:
+            return
+        self._meso_scan_ticks = 0
+        value = None
+        try:
+            frame = self._active_source().grab_full()
+            fw, fh = frame.size
+            fx, fy, fw2, fh2 = self._meso_box
+            x = max(0, int(fx * fw) - 2)
+            y = max(0, int(fy * fh) - 2)
+            x1 = min(fw, int((fx + fw2) * fw) + 2)
+            y1 = min(fh, int((fy + fh2) * fh) + 2)
+            if x1 > x and y1 > y:
+                img = frame.crop((x, y, x1, y1))
+                text = self._ocr.read_field(img)
+                value = parse_meso(text)
+        except Exception:
+            value = None
+        if value is not None:
+            self._auto_meso_misses = 0
+            self._last_meso = value
+            self._log(f"[{time.strftime('%H:%M:%S')}] meso auto value={value:,}")
+            self._session.record_meso(value)
+            self._render(self._last)
+        else:
+            # Stale box (inventory closed/dragged): every read misses while
+            # closed -- that is normal, so only a sustained streak forces a
+            # relocate (~6 misses @5s scan = ~30s) in case the counter moved.
+            self._auto_meso_misses += 1
+            if self._auto_meso_misses >= 6:
+                self._auto_meso_misses = 0
+                self._force_locate = True
 
     def _update_timer_label(self) -> None:
         """Split out of _render so the capture-error path in _do_tick can
