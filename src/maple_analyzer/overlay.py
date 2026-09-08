@@ -81,6 +81,37 @@ def _history_path() -> str:
     the cwd)."""
     return str(app_data_dir() / "MsStatTractor.history.json")
 
+
+def _icon_path() -> str | None:
+    """Absolute path to the window/app icon (assets/app.ico in the repo;
+    app.ico next to the exe when frozen -- the spec's datas puts it there).
+    None when missing (dev tree moved?), in which case callers keep the
+    default icon rather than crashing."""
+    try:
+        if getattr(sys, "frozen", False):
+            base = os.path.dirname(sys.executable)
+        else:
+            base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        for candidate in (os.path.join(base, "app.ico"), os.path.join(base, "assets", "app.ico")):
+            if os.path.isfile(candidate):
+                return candidate
+    except Exception:
+        pass
+    return None
+
+
+def _apply_window_icon(win) -> None:
+    """Set the Yeti-and-Wolf icon (user request 2026-09-08) on a Tk window so
+    the title bar and taskbar entry show it instead of the default feather.
+    Best-effort: a missing/unreadable icon keeps the default."""
+    p = _icon_path()
+    if p is None:
+        return
+    try:
+        win.iconbitmap(p)
+    except Exception:
+        pass
+
 # The console's codepage (e.g. cp950 Traditional Chinese) can't represent
 # every character OCR might misread out of the game's UI -- printing one
 # used to raise UnicodeEncodeError and silently kill the tick loop (see
@@ -606,6 +637,7 @@ class OverlayApp:
 
         self.root = ctk.CTk()
         self.root.title("MsStatTractor")
+        _apply_window_icon(self.root)  # Yeti-and-Wolf icon (2026-09-08)
         self.root.attributes("-topmost", self._settings.topmost)
         self.root.configure(fg_color=BG)
         # Window size (2026-09-02): widened from 320 to 400. The 320 width was
@@ -2873,6 +2905,7 @@ class OverlayApp:
             return
         win = ctk.CTkToplevel(self.root)
         win.title("MsStatTractor")
+        _apply_window_icon(win)  # match the main window's icon (2026-09-08)
         win.attributes("-topmost", True)
         win.configure(fg_color=BG)
         # 360x410 (was 360x350): cells now carry four lines each (title /
@@ -3677,6 +3710,7 @@ class _StartBaselineDialog:
 
         self.top = ctk.CTkToplevel(app.root)
         self.top.title("MsStatTractor")
+        _apply_window_icon(self.top)  # match the main window's icon (2026-09-08)
         self.top.attributes("-topmost", True)
         self.top.configure(fg_color=BG)
         # Tall enough that the button row keeps full size, centred on the main

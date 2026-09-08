@@ -18,6 +18,12 @@ datas = []
 binaries = []
 hiddenimports = []
 
+# Window/exe icon: the app.ico asset (Yeti-and-Wolf, user request 2026-09-08)
+# is embedded into the exe (EXE icon= below) AND shipped next to the exe so
+# the Tk windows can iconbitmap() it at runtime (_icon_path in overlay.py).
+_ICON = repo_root / "assets" / "app.ico"
+datas += [(_ICON.as_posix(), ".")]
+
 for pkg in ("customtkinter", "rapidocr_onnxruntime", "windows_capture"):
     pkg_datas, pkg_binaries, pkg_hiddenimports = collect_all(pkg)
     datas += pkg_datas
@@ -59,6 +65,7 @@ exe = EXE(
     upx=False,
     console=False,
     disable_windowed_traceback=False,
+    icon=_ICON.as_posix(),
 )
 
 coll = COLLECT(
