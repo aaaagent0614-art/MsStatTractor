@@ -10,10 +10,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 # captured_frames.py isn't importable by default -- add tests/ itself too.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-SAMPLE_IMAGE = Path(__file__).resolve().parent.parent / "samples" / "maple_story_ui.jpg"
-
-# A second real client screenshot at a different size and aspect ratio, for
-# checking that the proportional crops in regions.py survive the trip. The
-# game letterboxes (black bars, panel bottom-centre), so panel position tracks
-# aspect ratio and not just scale -- one sample per aspect is the point.
-SAMPLE_IMAGE_1920 = Path(__file__).resolve().parent.parent / "samples" / "maple_story_ui_1920.jpg"
+# Samples from AFTER the 2026-09-10 game patch, which reworked the bottom HUD
+# (fixed pixel size, horizontally centred status strip). The older 1351x800 and
+# 1920x1077 samples no longer describe what the game renders and are kept only
+# for reference. All three patched samples are native screenshots with the
+# window title bar already cropped off, so their size IS the client size.
+_SAMPLES = Path(__file__).resolve().parent.parent / "samples"
+SAMPLE_IMAGE = _SAMPLES / "maple_story_ui_patched_1366x768.png"
+SAMPLE_IMAGE_1920 = _SAMPLES / "maple_story_ui_patched_1920x1080.png"
+SAMPLE_IMAGE_2560 = _SAMPLES / "maple_story_ui_patched_2560x1440.png"

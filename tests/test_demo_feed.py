@@ -40,6 +40,6 @@ def test_other_fields_unaffected_by_synthetic_exp_redraw(ocr_engine):
     fields = feed.grab_fields()
     field_text = {name: ocr_engine.read_field(img) for name, img in fields.items()}
     snap = parse_fields(field_text)
-    assert snap.level == 44
-    assert (snap.hp_cur, snap.hp_max) == (377, 824)
-    assert (snap.mp_cur, snap.mp_max) == (1663, 2816)
+    assert snap.level == 47, field_text
+    assert (snap.hp_cur, snap.hp_max) == (629, 812), field_text
+    assert (snap.mp_cur, snap.mp_max) == (3024, 3024), field_text

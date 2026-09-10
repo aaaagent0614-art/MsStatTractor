@@ -28,6 +28,12 @@ from rapidocr_onnxruntime import RapidOCR
 _OCR_INTRA_OP_THREADS = 2
 _OCR_INTER_OP_THREADS = 1
 
+# read_field() upscales crops narrower than this before recognition -- see its
+# docstring. 200px covers the stat fields (80-125px wide) and the quickbar
+# slots, and leaves genuinely wide crops (full-width meso strips) untouched.
+_UPSCALE_BELOW_PX = 200
+_UPSCALE_FACTOR = 2
+
 
 class StatPanelOcr:
     def __init__(self) -> None:
@@ -41,7 +47,20 @@ class StatPanelOcr:
         )
 
     def read_field(self, image: Image.Image) -> str:
-        """Recognition-only OCR on a small pre-cropped single-line field crop."""
+        """Recognition-only OCR on a small pre-cropped single-line field crop.
+
+        Small crops are upscaled first: the patched (2026-09-10) HUD renders
+        the stat text smaller than before, and the engine drops digits and
+        separators at that size -- 'LV. 47' came back as 'LV. 07' and
+        'EXP 456903[82.22%]' lost the '3' and the '.', both of which corrupt
+        the parsed values rather than merely lowering confidence. LANCZOS
+        doubling costs ~10ms on a <200px crop and recovers all of them.
+        """
+        if image.width < _UPSCALE_BELOW_PX:
+            image = image.resize(
+                (image.width * _UPSCALE_FACTOR, image.height * _UPSCALE_FACTOR),
+                Image.Resampling.LANCZOS,
+            )
         result, _elapse = self._engine(np.array(image), use_det=False, use_cls=False)
         if not result:
             return ""

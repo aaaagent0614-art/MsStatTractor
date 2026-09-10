@@ -2,8 +2,8 @@
 
 This repo's dev environment has no Windows/game window to capture from, so this
 module fabricates plausible-looking successive frames by redrawing the EXP text
-in samples/maple_story_ui.jpg with an incrementing value, using the EXP field's
-real pixel box (measured off that screenshot -- see regions.py). Everything
+in the sample screenshot with an incrementing value, using the EXP field's real
+pixel box (measured off that screenshot -- see regions.py). Everything
 downstream of this (OCR, parsing, rate calc, overlay) is the real pipeline
 running against real inference, not mocked -- only the "camera" is fake.
 
@@ -19,9 +19,10 @@ from PIL import Image, ImageDraw, ImageFont
 
 from .regions import FIELD_BOXES, STAT_PANEL_BOX
 
-# EXP text box, measured directly off samples/maple_story_ui.jpg via OCR (see
-# session notes) -- absolute coords, same reference frame as STAT_PANEL_BOX.
-_EXP_TEXT_BOX = (716, 771, 818, 784)
+# EXP text box in the reference (post-2026-09-10 patch) client frame, measured
+# off samples/maple_story_ui_patched_1366x768.png via OCR -- absolute coords,
+# same reference frame as FIELD_BOXES, and kept tight for the same reason.
+_EXP_TEXT_BOX = (807, 729, 917, 742)
 
 
 class DemoExpFeed:
@@ -30,7 +31,7 @@ class DemoExpFeed:
         self._exp = start_exp
         self._exp_per_tick = exp_per_tick
         try:
-            self._font = ImageFont.truetype("DejaVuSans-Bold.ttf", 12)
+            self._font = ImageFont.truetype("DejaVuSans-Bold.ttf", 11)
         except OSError:
             self._font = ImageFont.load_default()
 

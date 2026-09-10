@@ -56,7 +56,7 @@ from .i18n import Lang, t
 from .ocr import StatPanelOcr
 from .parser import StatSnapshot, find_meso_candidate_verified, find_meso_in_region, find_stat_fields, parse_fields, parse_meso
 from .rate import Session, SessionSummary
-from .regions import QUICK_BAR_FRAC
+from .regions import QUICK_BAR_FRAC, quick_bar_box_from_stat
 from .region_selector import RegionSelector
 from .settings import Settings, app_data_dir, load_settings, save_settings
 
@@ -274,6 +274,31 @@ def _quick_count_text(text: str) -> str | None:
     return t
 
 
+def _divide_quick_counts(
+    digs: list[tuple[str, int, int, int, int]], w: int, h: int,
+) -> dict[int, int]:
+    """Assign counts by dividing the crop into four columns x two rows.
+
+    Correct only when the crop is tightly aligned to the slot grid -- which it
+    is for the box _grab_quick_bar_image derives from the stat strip. Used as
+    the fallback both when no key label is readable at all and when the labels
+    that WERE read carry no top-row anchor (measured 2026-09-10: a native
+    1366-wide capture yielded only 'End', a bottom-row key, and the old code
+    bailed out with {} on a perfectly well-divided crop).
+    """
+    result: dict[int, int] = {}
+    for text, x, y, bw, bh in digs:
+        val = parse_meso(text)
+        if val is None:
+            continue
+        cx, cy = x + bw / 2.0, y + bh / 2.0
+        col = int(cx / (w / 4.0))
+        row = int(cy / (h / 2.0))
+        if 0 <= col < 4 and 0 <= row < 2:
+            result[row * 4 + col + 1] = val
+    return result
+
+
 def _quickbar_slots_from_boxes(
     boxes: list[tuple[int, int, int, int, str]], w: int, h: int,
 ) -> dict[int, int]:
@@ -303,16 +328,7 @@ def _quickbar_slots_from_boxes(
 
     if not keys:
         # Fallback: equal division over the crop (original behaviour).
-        for text, x, y, bw, bh in digs:
-            val = parse_meso(text)
-            if val is None:
-                continue
-            cx, cy = x + bw / 2.0, y + bh / 2.0
-            col = int(cx / (w / 4.0))
-            row = int(cy / (h / 2.0))
-            if 0 <= col < 4 and 0 <= row < 2:
-                result[row * 4 + col + 1] = val
-        return result
+        return _divide_quick_counts(digs, w, h)
 
     # Top-row key labels anchor the four column centres. The labels' NAMES
     # fix their logical column (Shift=0..PgUp=3), so the slot width comes
@@ -331,7 +347,11 @@ def _quickbar_slots_from_boxes(
         if col not in by_col:
             by_col[col] = cx
     if not by_col:
-        return result
+        # No top-row anchor to build column geometry from (e.g. only a
+        # bottom-row label was readable). The derived crop is aligned to the
+        # slot grid, so equal division is the right fallback here too --
+        # returning {} threw away counts that were read fine.
+        return _divide_quick_counts(digs, w, h)
     cols_sorted = sorted(by_col)
     c0, cN = cols_sorted[0], cols_sorted[-1]
     x0c, xNc = by_col[c0], by_col[cN]
@@ -1801,10 +1821,28 @@ class OverlayApp:
         if getattr(self, "_manual_status_label", None) is not None:
             self._refresh_manual_status()
 
+    def _derived_quick_bar_box(self, frame_size):
+        """Quickbar bounds derived from the detected stat strip, or None.
+
+        Post-2026-09-10 patch the bottom strip keeps a fixed pixel width and is
+        centred, so the quickbar's fractional position moves with the client
+        width -- a fixed QUICK_BAR_FRAC crop misses it (measured: it read {} on
+        a 1366-wide client and on a 1.875x-magnified 1366 frame, while the
+        derived box hit both). Uses _stat_boxes, which the locator fills in
+        from the same detection pass (see regions.quick_bar_box_from_stat)."""
+        sb = getattr(self, "_stat_boxes", None)
+        if not sb or "LV" not in sb or "EXP" not in sb:
+            return None
+        w, _h = frame_size
+        lv, ex = sb["LV"], sb["EXP"]
+        return quick_bar_box_from_stat(lv[0] * w, (ex[0] + ex[2]) * w, frame_size)
+
     def _grab_quick_bar_image(self) -> Image.Image | None:
-        """The whole quickbar row as an image: the manually marked screen
-        region when set (mss, screen coords), else the auto bottom-right
-        region cropped out of the game frame (QUICK_BAR_FRAC)."""
+        """The whole quickbar row as an image.
+
+        Priority: the manually marked screen region (mss, screen coords), then
+        the position derived from the detected stat strip, then the
+        QUICK_BAR_FRAC last-resort crop."""
         s = self._settings
         if s.manual_quick_bar_region is not None:
             if sys.platform != "win32":
@@ -1818,13 +1856,58 @@ class OverlayApp:
                 return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
             except Exception:
                 return None
+        if s.use_manual:
+            # Manual mode's grab_full() is the marked stat strip, not the whole
+            # client, so cropping QUICK_BAR_FRAC out of it yielded a meaningless
+            # sliver. Derive the quickbar's *screen* rect instead, measuring
+            # against the marked strip's rect.
+            return self._grab_derived_quick_bar_manual()
         try:
             frame = self._active_source().grab_full()
         except Exception:
             return None
+        box = self._derived_quick_bar_box(frame.size)
+        if box is not None:
+            return frame.crop(box)
         w, h = frame.size
         l, t, r, b = QUICK_BAR_FRAC
         return frame.crop((int(l * w), int(t * h), int(r * w), int(b * h)))
+
+    def _grab_derived_quick_bar_manual(self) -> Image.Image | None:
+        """Manual mode without a marked quickbar: derive its screen rect from
+        the marked stat strip plus the LV/EXP boxes the locator detected inside
+        it. The strip's bottom screen edge counts as the frame bottom (the
+        status bar sits on it), so the derived quickbar lands above the strip --
+        outside the marked region, which is why this grabs via mss rather than
+        cropping the marked frame."""
+        if sys.platform != "win32":
+            return None
+        s = self._settings
+        region = s.manual_stat_region
+        sb = getattr(self, "_stat_boxes", None)
+        if region is None or not sb or "LV" not in sb or "EXP" not in sb:
+            return None
+        left, top, right, bottom = region
+        cw, ch = right - left, bottom - top
+        lv, ex = sb["LV"], sb["EXP"]
+        box = quick_bar_box_from_stat(
+            left + lv[0] * cw,
+            left + (ex[0] + ex[2]) * cw,
+            (cw, ch),
+            bottom_y=bottom,
+            clamp=False,
+        )
+        if box is None:
+            return None
+        l, t, r, b = box
+        try:
+            import mss
+
+            with mss.mss() as m:
+                shot = m.grab({"left": l, "top": t, "width": r - l, "height": b - t})
+            return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        except Exception:
+            return None
 
     def _save_quickbar_debug(self, img=None, scale: int = 1, boxes=None) -> None:
         """Dump the quickbar crop + OCR boxes next to the app so a failing
@@ -1857,10 +1940,13 @@ class OverlayApp:
                 self._save_quickbar_debug()
             return {}
         # Tiny native-resolution quickbars read badly at 1x -- upscale small
-        # crops before detection (LANCZOS, cheap on a <300px-wide region).
+        # crops before detection (LANCZOS, cheap on a region this size). 3x, not
+        # 2x: the digits are ~11px tall at 1366 and ~22px in a magnified frame,
+        # and 2x still dropped the counts on the magnified sample (measured
+        # 2026-09-10 across the three patched screenshots; 3x reads all three).
         scale = 1
         if min(img.size) < 300:
-            scale = 2
+            scale = 3
             img = img.resize(
                 (img.width * scale, img.height * scale), Image.Resampling.LANCZOS
             )
@@ -2013,17 +2099,23 @@ class OverlayApp:
                 # Located path (Megapipe-safe): crop each detected field box
                 # out of a single full-frame grab and OCR them recognition-
                 # only, exactly like grab_fields does for the fixed boxes.
-                # Detection boxes are tight, so pad each crop slightly.
+                # Detection boxes are tight around the text, and tight is what
+                # the recogniser wants: padding them (as this did before
+                # 2026-09-10) pulled background into the crop and cost digits
+                # -- 'LV. 47' came back as 'LV. @7' / 'LV. a7' and the EXP
+                # percentage stopped parsing. Measured on the patched
+                # 1366/1920/2560 samples: pad=0 reads all four fields correctly
+                # on all three, pad>=2 does not.
                 frame = self._active_source().grab_full()
                 fw, fh = frame.size
                 field_images = {}
                 for name, (fx, fy, fw2, fh2) in self._stat_boxes.items():
                     if name not in ("LV", "EXP"):
                         continue  # HP/MP no longer tracked (2026-09-02)
-                    x = max(0, int(fx * fw) - 2)
-                    y = max(0, int(fy * fh) - 2)
-                    w = max(1, int(fw2 * fw) + 4)
-                    h = max(1, int(fh2 * fh) + 4)
+                    x = max(0, int(fx * fw))
+                    y = max(0, int(fy * fh))
+                    w = max(1, int(fw2 * fw))
+                    h = max(1, int(fh2 * fh))
                     field_images[name] = frame.crop((x, y, min(fw, x + w), min(fh, y + h)))
             else:
                 field_images = self._active_source().grab_fields()
@@ -2414,10 +2506,12 @@ class OverlayApp:
             for name, (fx, fy, fw2, fh2) in stat_frac.items():
                 if name not in ("LV", "EXP"):
                     continue  # HP/MP no longer tracked (2026-09-02)
-                x = max(0, int(fx * fw) - 2)
-                y = max(0, int(fy * fh) - 2)
-                w = max(1, int(fw2 * fw) + 4)
-                h = max(1, int(fh2 * fh) + 4)
+                # No padding -- see the tick path's comment: padding the
+                # detection box corrupts the digits on the patched UI.
+                x = max(0, int(fx * fw))
+                y = max(0, int(fy * fh))
+                w = max(1, int(fw2 * fw))
+                h = max(1, int(fh2 * fh))
                 field_images[name] = frame.crop((x, y, min(fw, x + w), min(fh, y + h)))
             field_text = {name: self._ocr.read_field(img) for name, img in field_images.items()}
             snap = parse_fields(field_text)
