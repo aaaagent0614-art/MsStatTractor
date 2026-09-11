@@ -307,7 +307,10 @@ def find_meso_in_region(
 # meso box has ~157 gold pixels in the lookbehind window; a floating damage
 # number ("1048") has 0. Threshold 60 keeps a comfortable margin on both
 # sides (a 1.348x downscale to the native 1366x768 still leaves ~87).
-_GOLD_LEFT_LOOKBACK = 90  # how far left of the box to look
+_GOLD_LEFT_LOOKBACK = 90  # minimum lookback, in reference-1366 pixels
+# ...but the icon's distance from the digits scales with the UI (see the
+# 2026-09-11 note below), so the window is at least this many ROW HEIGHTS.
+_GOLD_LEFT_LOOKBACK_ROWS = 6.0
 _GOLD_LEFT_VPAD = 12      # vertical padding above/below the box
 _GOLD_MIN_PX = 60         # gold pixels required in that window
 
@@ -343,7 +346,16 @@ def _count_gold_left_of(frame_rgb, x: int, y: int, w: int, h: int) -> int:
     hsv = np.asarray(Image.fromarray(np.asarray(frame_rgb)).convert("HSV"))
     H, S, V = hsv[..., 0].astype(int), hsv[..., 1].astype(int), hsv[..., 2].astype(int)
     gold = (H >= 22) & (H <= 48) & (S >= 110) & (V >= 150)
-    x0, x1 = max(0, x - 4 - _GOLD_LEFT_LOOKBACK), max(0, x - 4)
+    # The coin icon sits a fixed FRACTION OF THE ROW left of the digits, so the
+    # lookbehind window has to grow with the UI scale -- the row height is the
+    # scale proxy that needs no extra plumbing. Measured 2026-09-11 on Alex's
+    # 2559x1439 (1.87x) frame: the icon ends 92px left of the digits, just past
+    # the old fixed 90px window, so the REAL meso row scored 38 gold pixels and
+    # was rejected -- the counter "could not be read at max resolution" while
+    # 1366/1920 stayed inside the window. 6 row-heights = 90px at the reference
+    # row height (~15px) and 174px at 1.87x, which covers every measured frame.
+    lookback = max(_GOLD_LEFT_LOOKBACK, int(round(_GOLD_LEFT_LOOKBACK_ROWS * h)))
+    x0, x1 = max(0, x - 4 - lookback), max(0, x - 4)
     y0, y1 = max(0, y - _GOLD_LEFT_VPAD), min(gold.shape[0], y + h + _GOLD_LEFT_VPAD)
     if x1 <= x0 or y1 <= y0:
         return 0

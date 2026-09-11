@@ -56,7 +56,7 @@ from .i18n import Lang, t
 from .ocr import StatPanelOcr
 from .parser import ExpTotalTracker, StatSnapshot, find_meso_candidate_verified, find_meso_in_region, find_stat_fields, parse_fields, parse_meso
 from .rate import Session, SessionSummary
-from .regions import QUICK_BAR_FRAC, quick_bar_box_from_stat
+from .regions import QUICK_BAR_FRAC, STAT_SPAN_PX, quick_bar_box_from_stat
 from .region_selector import RegionSelector
 from .settings import Settings, app_data_dir, load_settings, save_settings
 
@@ -393,6 +393,74 @@ def _quickbar_slots_from_boxes(
         if val is not None:
             result[slot] = val
     return result
+
+
+_QUICK_BAR_MIN_NORM_SIDE = 300  # smallest side the detector wants, in 1366 pixels
+_QUICK_BAR_NORM_ABOVE = 1.15    # UI scale past which the crop is normalised
+
+
+def _merge_stat_boxes(old: dict | None, new: dict) -> dict:
+    """Keep previously located fields a partial detection pass did not re-find.
+
+    A pass that sees the LV text but not the EXP text (combat effects, a
+    transient OCR dip, or the frames either side of a resolution switch) used
+    to REPLACE the complete box set with the partial one, and the missing field
+    then stayed missing for minutes: the 2026-09-11 2560 log shows EXP absent
+    from every tick for 4 minutes (the derived quickbar box needs LV *and* EXP,
+    so the potion rows lost their anchor too). Merging is safe because the
+    located boxes are fractions of the frame, and the fields sit at fixed
+    offsets from each other inside the same strip.
+    """
+    if not old:
+        return dict(new)
+    merged = dict(old)
+    merged.update(new)
+    return merged
+
+
+def _stat_ui_scale(stat_boxes, width: float | int | None) -> float:
+    """The frame's UI scale, measured from the detected LV->EXP span.
+
+    `stat_boxes` is the located {name: (x, y, w, h)} in FRACTIONS of the frame
+    and `width` its pixel width; the span over regions.STAT_SPAN_PX is the same
+    scale regions.quick_bar_box_from_stat uses to place the quickbar. 1.0 =
+    the reference 1366 UI (or nothing detected yet), which callers treat as
+    "no normalisation needed".
+    """
+    if not stat_boxes or "LV" not in stat_boxes or "EXP" not in stat_boxes:
+        return 1.0
+    if not width:
+        return 1.0
+    lv, ex = stat_boxes["LV"], stat_boxes["EXP"]
+    span = ((ex[0] + ex[2]) - lv[0]) * float(width)
+    if span <= 1.0:
+        return 1.0
+    return span / STAT_SPAN_PX
+
+
+def _quick_bar_detect_size(
+    size: tuple[int, int], ui_scale: float
+) -> tuple[int, int, float]:
+    """Pixel size to run quickbar detection at, plus the factor back to it.
+
+    The quickbar crop is ~1366-UI-pixel sized on a native client, but on a
+    magnified/high-resolution frame it is `ui_scale` times bigger -- and the
+    detector's sweet spot is the reference size, so a big crop upscaled 3x more
+    reads as garbage. Measured 2026-09-11 on Alex's 1.87x frame (crop 282x149):
+    the shipped path returned {} and {8: 126} (a misread), the same crop
+    normalised to 151x80 and upscaled 3x read {4: 64, 8: 196} correctly. So:
+    normalise to reference pixels first, then apply the small-crop upscale.
+
+    Returns (target_w, target_h, total_scale) where total_scale divides
+    detection coordinates back into the normalised crop's own frame -- the
+    frame _quickbar_slots_from_boxes expects (its geometry was tuned there).
+    """
+    w, h = size
+    norm = float(ui_scale) if ui_scale and ui_scale > _QUICK_BAR_NORM_ABOVE else 1.0
+    nw, nh = max(1, round(w / norm)), max(1, round(h / norm))
+    up = 3 if min(nw, nh) < _QUICK_BAR_MIN_NORM_SIDE else 1
+    return nw * up, nh * up, (up / norm)
+
 
 # Number of history sessions at which the History tab starts nudging the user
 # to clean up old records (see _update_history_summary).
@@ -1851,6 +1919,14 @@ class OverlayApp:
             if sys.platform != "win32":
                 return None
             l, t, r, b = s.manual_quick_bar_region
+            # A marked quickbar region is screen-sized, so tell the detector
+            # input scaler how big this UI is (measured against the marked stat
+            # strip's width, where the located fields' fractions live).
+            region = s.manual_stat_region
+            self._quick_bar_ui_scale = _stat_ui_scale(
+                getattr(self, "_stat_boxes", None),
+                (region[2] - region[0]) if region else None,
+            )
             try:
                 import mss
 
@@ -1869,6 +1945,11 @@ class OverlayApp:
             frame = self._active_source().grab_full()
         except Exception:
             return None
+        # Detection needs the crop scaled to reference pixels when the UI is
+        # magnified (see _quick_bar_detect_size).
+        self._quick_bar_ui_scale = _stat_ui_scale(
+            getattr(self, "_stat_boxes", None), frame.size[0]
+        )
         box = self._derived_quick_bar_box(frame.size)
         if box is not None:
             return frame.crop(box)
@@ -1892,6 +1973,7 @@ class OverlayApp:
             return None
         left, top, right, bottom = region
         cw, ch = right - left, bottom - top
+        self._quick_bar_ui_scale = _stat_ui_scale(sb, cw)
         lv, ex = sb["LV"], sb["EXP"]
         box = quick_bar_box_from_stat(
             left + lv[0] * cw,
@@ -1912,7 +1994,7 @@ class OverlayApp:
         except Exception:
             return None
 
-    def _save_quickbar_debug(self, img=None, scale: int = 1, boxes=None) -> None:
+    def _save_quickbar_debug(self, img=None, scale: float = 1.0, boxes=None) -> None:
         """Dump the quickbar crop + OCR boxes next to the app so a failing
         potion read can be diagnosed from the image instead of guesswork
         (v1.9.3 diagnostic; remove once the misread is fixed)."""
@@ -1942,17 +2024,21 @@ class OverlayApp:
             if debug_out:
                 self._save_quickbar_debug()
             return {}
-        # Tiny native-resolution quickbars read badly at 1x -- upscale small
-        # crops before detection (LANCZOS, cheap on a region this size). 3x, not
-        # 2x: the digits are ~11px tall at 1366 and ~22px in a magnified frame,
-        # and 2x still dropped the counts on the magnified sample (measured
-        # 2026-09-10 across the three patched screenshots; 3x reads all three).
-        scale = 1
-        if min(img.size) < 300:
-            scale = 3
-            img = img.resize(
-                (img.width * scale, img.height * scale), Image.Resampling.LANCZOS
-            )
+        # Normalise the crop back to reference-1366 pixels FIRST, then upscale
+        # small crops (LANCZOS, cheap on a region this size). 3x, not 2x: the
+        # digits are ~11px tall at 1366 and 2x still dropped the counts on the
+        # magnified sample (measured 2026-09-10 across the three patched
+        # screenshots; 3x reads all three). The normalisation is what makes
+        # that measurement hold on a magnified frame too: its crop is already
+        # ~1.87x those pixels, and upscaling THAT another 3x pushed the
+        # detector out of its range -- Alex's max-resolution frames came back
+        # {} / {8: 126} (a misread) while the same crop normalised to 151x80
+        # read {4: 64, 8: 196} correctly (2026-09-11).
+        target_w, target_h, total = _quick_bar_detect_size(
+            img.size, getattr(self, "_quick_bar_ui_scale", 1.0)
+        )
+        if (target_w, target_h) != img.size:
+            img = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
         try:
             boxes = self._ocr.detect_text(img)
         except Exception:
@@ -1960,16 +2046,16 @@ class OverlayApp:
         if debug_out:
             # Save the crop + boxes at the SAME scale (both pre-downscale)
             # so the dump matches the image pixel-for-pixel when diagnosing.
-            self._save_quickbar_debug(img, scale, boxes)
+            self._save_quickbar_debug(img, total, boxes)
         w, h = img.size
         if w <= 0 or h <= 0:
             return {}
-        if scale > 1:
+        if total != 1.0:
             boxes = [
-                (int(x // scale), int(y // scale), int(bw // scale), int(bh // scale), text)
+                (int(x / total), int(y / total), int(bw / total), int(bh / total), text)
                 for x, y, bw, bh, text in boxes
             ]
-            w, h = w // scale, h // scale
+            w, h = int(round(w / total)), int(round(h / total))
         return _quickbar_slots_from_boxes(boxes, w, h)
 
     def _scan_quick_slots_to_last(self) -> None:
@@ -2571,6 +2657,9 @@ class OverlayApp:
     ) -> None:
         """Main-thread half of the locator pass (see _try_locate)."""
         if stat_frac:
+            # Merge with whatever was already located: a pass that finds only
+            # some fields must not delete the others (see _merge_stat_boxes).
+            stat_frac = _merge_stat_boxes(self._stat_boxes, stat_frac)
             self._stat_boxes = stat_frac
             cs = getattr(self._active_source(), "client_size", None)
             if cs is not None:

@@ -392,3 +392,32 @@ def test_second_row_is_the_leaf_row_not_a_digit_row():
     boxes = [(150, 80, 75, 21, "1,371,339"), (149, 108, 91, 21, "0相藥點数")]
     found = find_meso_candidate_verified(boxes, img, img.size)
     assert found is not None and found[4] == 1_371_339
+
+
+# ---- coin-icon distance scales with the UI (2026-09-11) -------------------
+
+def test_gold_lookback_scales_with_the_row_height():
+    """The icon-to-digits gap is a fraction of the ROW, so the lookbehind
+    window has to grow with it.
+
+    Measured on Alex's max-resolution frame (2559x1439, UI 1.87x): the coin
+    ends 92px left of the digits and the row is 29px tall, so the fixed 90px
+    window scored only 38 gold pixels and the REAL counter was rejected -- that
+    is what "the meso can't be read at max resolution" was, while 1366/1920
+    frames stayed inside the window. 6 row-heights = 174px here.
+    """
+    img = Image.new("RGB", (1200, 400), _BG)
+    ImageDraw.Draw(img).ellipse((400, 100, 448, 148), fill=_COIN)  # ends 92px left
+    assert _count_gold_left_of(img, 540, 100, 163, 29) >= _GOLD_MIN_PX
+    boxes = [(540, 100, 163, 29, "1,358,226"), (532, 145, 112, 26, "0楓葉點數")]
+    found = find_meso_candidate_verified(boxes, img, img.size)
+    assert found is not None and found[4] == 1_358_226
+
+
+def test_gold_lookback_still_has_a_limit():
+    """Growing with the row must not turn the check into "gold anywhere to the
+    left": at this row height the window reaches 174px, not the whole frame."""
+    img = Image.new("RGB", (1200, 400), _BG)
+    ImageDraw.Draw(img).ellipse((100, 100, 148, 148), fill=_COIN)  # 390px away
+    boxes = [(540, 100, 163, 29, "1,358,226"), (532, 145, 112, 26, "0楓葉點數")]
+    assert find_meso_candidate_verified(boxes, img, img.size) is None
