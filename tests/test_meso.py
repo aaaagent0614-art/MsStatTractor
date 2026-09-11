@@ -169,6 +169,45 @@ def test_find_stat_fields_lv_label_only_fallback():
     assert "EXP" in found
 
 
+def test_find_stat_fields_ignores_a_monster_name_tag():
+    """A monster's name tag renders 'Lv.48 大幽靈' -- a literal _LV_RE match,
+    out in the play field. Given the frame size it must never beat the real
+    strip at the bottom (2026-09-11: it did, so the derived quickbar geometry
+    measured its UI scale from 244px instead of 1693px and landed in the
+    status strip, returning {} for the potion counts)."""
+    boxes = [
+        (1025, 991, 280, 33, "Lv.48大幽靈Lv.48大靈"),  # 0.69 of the height
+        (1470, 992, 135, 30, "Lv.48大幽靈"),           # another, slightly lower
+        (21, 1384, 65, 39, "Lv."),                     # the real strip, split
+        (103, 1393, 46, 28, "49"),
+        (1515, 1371, 199, 25, "EXP 554398[84.62%]"),
+    ]
+    found = find_stat_fields(boxes, (2557, 1438))
+    assert "EXP" in found
+    assert "LV" in found
+    x, y, _w, _h = found["LV"]
+    assert y > 1300 and x < 200, found["LV"]
+    # Without a frame size the band filter is off -- loose matches still win.
+    assert find_stat_fields(boxes)["LV"][1] > 900
+
+
+def test_find_stat_fields_prefers_the_lowest_match():
+    """Two boxes match the same field: the strip's is the lower one."""
+    boxes = [
+        (100, 300, 90, 24, "LV. 48"),
+        (100, 1000, 90, 24, "LV. 49"),
+    ]
+    assert find_stat_fields(boxes, (1000, 1050))["LV"][1] == 1000
+
+
+def test_find_stat_fields_falls_back_when_nothing_is_in_the_band():
+    """A manually marked region can be much taller than the strip, leaving the
+    fields outside the band. Reporting the unfiltered result beats reporting
+    nothing at all (manual mode's 辨識 pass)."""
+    boxes = [(100, 500, 90, 24, "LV. 49"), (400, 500, 120, 24, "HP[900/900]")]
+    assert find_stat_fields(boxes, (1000, 1000))["LV"] == (100, 500, 90, 24)
+
+
 # ---- end-to-end through the real OCR engine ------------------------------
 
 def _game_like_frame():
@@ -253,9 +292,15 @@ def test_gold_verify_rejects_number_without_coin():
     assert find_meso_candidate_verified(boxes, img, img.size) is None
 
 
+def _points_row(x: int = 155, y: int = 107) -> tuple[int, int, int, int, str]:
+    """The 楓葉點數 row that always sits under the 楓幣 row (same font, so the
+    same box height). Detection merges its bare '0' with the label."""
+    return (x, y, 85, 22, "0楓葉點數")
+
+
 def test_gold_verify_accepts_real_meso():
     img = _frame_with_coin()  # coin at x 60-90
-    boxes = [(150, 80, 75, 21, "1,371,339")]
+    boxes = [(150, 80, 75, 21, "1,371,339"), _points_row()]
     found = find_meso_candidate_verified(boxes, img, img.size)
     assert found is not None
     assert found[4] == 1_371_339
@@ -268,6 +313,7 @@ def test_gold_verify_prefers_verified_over_larger():
     boxes = [
         (400, 80, 100, 21, "999999999"),   # bigger, but no coin to its left
         (150, 80, 75, 21, "1,371,339"),    # the real meso counter
+        _points_row(),
     ]
     found = find_meso_candidate_verified(boxes, img, img.size)
     assert found is not None
@@ -296,6 +342,53 @@ def test_gold_verify_zero_reading_is_not_trusted():
     # The zero must not shadow a real balance read in the same pass either:
     # candidates are tried most-digits first, and a large non-zero backed by
     # the coin wins over the zero.
-    boxes = [(220, 80, 30, 21, "0"), (160, 80, 75, 21, "523,000")]
+    boxes = [
+        (220, 80, 30, 21, "0"),
+        (160, 80, 75, 21, "523,000"),
+        _points_row(x=165),
+    ]
     found = find_meso_candidate_verified(boxes, img, img.size)
     assert found is not None and found[4] == 523_000
+
+
+# ---- second currency row (楓葉點數) verification, 2026-09-11 --------------
+
+def test_second_row_is_required():
+    """A coin-backed number with nothing under it is NOT the meso row. This
+    is what the coin check alone could not tell apart: a floating damage
+    number with any yellow thing to its left cleared the gold threshold, so
+    the live log booked value=8 / value=625 and the 2560 sample booked 180
+    while the inventory was closed."""
+    img = _frame_with_coin()
+    boxes = [(150, 80, 75, 21, "180")]
+    assert find_meso_candidate_verified(boxes, img, img.size) is None
+
+
+def test_second_row_must_be_the_same_font_size():
+    """The two currency rows share a font, so their boxes share a height. An
+    unrelated game-world label that merely happens to sit ~90px below a big
+    damage number is not a currency row (measured on the 2560 sample: a
+    70px-tall '180' paired with a 30px label)."""
+    img = _frame_with_coin()
+    boxes = [
+        (150, 80, 136, 70, "180"),
+        (160, 168, 74, 30, "布偏希斯"),  # dy=88, inside the 0.6-2.2 band
+    ]
+    assert find_meso_candidate_verified(boxes, img, img.size) is None
+
+
+def test_second_row_must_sit_directly_below():
+    """Too far down is not the same row -- a chat line or a quickbar key
+    label underneath must not stand in for 楓葉點數."""
+    img = _frame_with_coin()
+    boxes = [(150, 80, 75, 21, "1,371,339"), _points_row(y=200)]
+    assert find_meso_candidate_verified(boxes, img, img.size) is None
+
+
+def test_second_row_is_the_leaf_row_not_a_digit_row():
+    """The points counter renders as a bare '0' merged with its label, so the
+    check must accept a text row (not demand a pure-digit box)."""
+    img = _frame_with_coin()
+    boxes = [(150, 80, 75, 21, "1,371,339"), (149, 108, 91, 21, "0相藥點数")]
+    found = find_meso_candidate_verified(boxes, img, img.size)
+    assert found is not None and found[4] == 1_371_339

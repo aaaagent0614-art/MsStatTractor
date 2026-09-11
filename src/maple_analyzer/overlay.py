@@ -54,7 +54,7 @@ from PIL import Image
 from . import __version__
 from .i18n import Lang, t
 from .ocr import StatPanelOcr
-from .parser import StatSnapshot, find_meso_candidate_verified, find_meso_in_region, find_stat_fields, parse_fields, parse_meso
+from .parser import ExpTotalTracker, StatSnapshot, find_meso_candidate_verified, find_meso_in_region, find_stat_fields, parse_fields, parse_meso
 from .rate import Session, SessionSummary
 from .regions import QUICK_BAR_FRAC, quick_bar_box_from_stat
 from .region_selector import RegionSelector
@@ -639,6 +639,9 @@ class OverlayApp:
         # before a session has started (see _render). Updated by the locator
         # and the manual meso scan regardless of run_state.
         self._last_meso: int | None = None
+        # Cross-checks the OCR'd EXP percentage against exp_cur and rewrites
+        # the known '6 read as 8' misread in place (parser.ExpTotalTracker).
+        self._exp_tracker = ExpTotalTracker()
         # Same idea for the quick-slot potion counts (2026-09-03): the 辨識
         # pass reads them so the potion rows show a value before Start.
         self._last_hp_slot_count: int | None = None
@@ -2160,6 +2163,7 @@ class OverlayApp:
         field_images = {k: v for k, v in field_images.items() if k in ("LV", "EXP")}
         field_text = {name: self._ocr.read_field(img) for name, img in field_images.items()}
         snap = parse_fields(field_text)
+        self._exp_tracker.sanitize(snap)
         # Locator demand signal: several consecutive ticks where neither LV
         # nor EXP parsed means the panel moved out from under the cached
         # boxes (window dragged / resized / magnifier changed / covered) --
@@ -2309,7 +2313,7 @@ class OverlayApp:
                 else:
                     frame = self._source.grab_full()
                 boxes = locate_ocr.detect_text(frame)
-                stat = find_stat_fields(boxes)
+                stat = find_stat_fields(boxes, frame.size)
                 meso_found = find_meso_candidate_verified(boxes, frame, frame.size)
                 fw, fh = frame.size
                 stat_frac = {
@@ -2350,7 +2354,7 @@ class OverlayApp:
             else:
                 frame = self._source.grab_full()
             boxes = self._ocr.detect_text(frame)
-            stat = find_stat_fields(boxes)
+            stat = find_stat_fields(boxes, frame.size)
             meso_found = find_meso_candidate_verified(boxes, frame, frame.size) if self._settings.track_meso else None
             fw, fh = frame.size
             stat_frac = {
@@ -2402,7 +2406,7 @@ class OverlayApp:
             cap = ManualScreenCapture(s.manual_stat_region, s.manual_meso_region)
             frame = cap.grab_full()
             boxes = self._ocr.detect_text(frame)
-            stat = find_stat_fields(boxes)
+            stat = find_stat_fields(boxes, frame.size)
             fw, fh = frame.size
             stat_frac = {
                 name: (x / fw, y / fh, w / fw, h / fh)
@@ -2515,6 +2519,7 @@ class OverlayApp:
                 field_images[name] = frame.crop((x, y, min(fw, x + w), min(fh, y + h)))
             field_text = {name: self._ocr.read_field(img) for name, img in field_images.items()}
             snap = parse_fields(field_text)
+            self._exp_tracker.sanitize(snap)
             merged = StatSnapshot(*(
                 new if new is not None else old
                 for new, old in zip(vars(snap).values(), vars(self._last).values())

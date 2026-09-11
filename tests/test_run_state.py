@@ -19,7 +19,7 @@ import pytest
 
 from maple_analyzer import overlay as overlay_module
 from maple_analyzer.overlay import OverlayApp
-from maple_analyzer.parser import StatSnapshot
+from maple_analyzer.parser import ExpTotalTracker, StatSnapshot
 from maple_analyzer.rate import Session, SessionSummary
 from maple_analyzer.settings import Settings
 
@@ -147,6 +147,8 @@ class _StubApp:
         self._compact_win = None
         self._manual_overrides: dict = {}
         self._last_meso: int | None = None
+        # Mirrors OverlayApp.__init__: the tick calls sanitize() on it.
+        self._exp_tracker = ExpTotalTracker()
         self._last_hp_slot_count: int | None = None
         self._last_mp_slot_count: int | None = None
         self._sale_done = False
