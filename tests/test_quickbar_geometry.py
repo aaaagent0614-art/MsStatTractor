@@ -22,8 +22,10 @@ from maple_analyzer.ocr import StatPanelOcr
 from maple_analyzer.overlay import (
     _divide_quick_counts,
     _quick_bar_detect_size,
+    _quick_bar_detect_steps,
     _quickbar_slots_from_boxes,
     _stat_ui_scale,
+    _ui_scale_from_quick_bar_box,
 )
 from maple_analyzer.parser import find_stat_fields
 from maple_analyzer.regions import quick_bar_box_from_stat
@@ -48,16 +50,25 @@ def _ui_scale(image: Image.Image, found: dict) -> float:
 def _read_slots(
     image: Image.Image, box, ocr: StatPanelOcr, ui_scale: float = 1.0
 ) -> dict[int, int]:
-    """Mirror of OverlayApp._read_slot_counts' crop + scaling behaviour."""
+    """Mirror of OverlayApp._read_slot_counts' crop + scaling behaviour.
+
+    Two SEPARATE resizes: normalise to reference pixels, then upscale. Doing
+    both in one resize (crop -> norm*up) is what read the PgUp count as
+    '10.80' on the 1.87x sample (2026-09-14) -- see _quick_bar_detect_steps.
+    """
     crop = image.crop(box)
-    tw, th, total = _quick_bar_detect_size(crop.size, ui_scale)
-    det = crop.resize((tw, th), Image.Resampling.LANCZOS) if (tw, th) != crop.size else crop
+    (nw, nh), norm, up = _quick_bar_detect_steps(crop.size, ui_scale)
+    if (nw, nh) != crop.size:
+        crop = crop.resize((nw, nh), Image.Resampling.LANCZOS)
+    if up != 1:
+        crop = crop.resize((nw * up, nh * up), Image.Resampling.LANCZOS)
+    total = up / norm
     boxes = [
         (int(x / total), int(y / total), int(w / total), int(h / total), t)
-        for x, y, w, h, t in ocr.detect_text(det)
+        for x, y, w, h, t in ocr.detect_text(crop)
     ]
     return _quickbar_slots_from_boxes(
-        boxes, int(round(det.width / total)), int(round(det.height / total))
+        boxes, int(round(crop.width / total)), int(round(crop.height / total))
     )
 
 
@@ -70,7 +81,11 @@ def test_derived_box_reads_the_potion_count(ocr_engine, path):
     box = quick_bar_box_from_stat(lv[0], ex[0] + ex[2], image.size)
     assert box is not None
     slots = _read_slots(image, box, ocr_engine, _ui_scale(image, found))
-    # PgDn (slot 8) holds the 1343-count potion stack on all three samples.
+    # Both potion stacks: PgUp (slot 4) holds 108, PgDn (slot 8) holds 1343.
+    # Slot 4 is the one the max-resolution frame used to lose -- its count came
+    # back as '10.80' / '10.81' (a phantom decimal point from collapsing the
+    # normalise+upscale resizes into one), which _quick_count_text rejects.
+    assert slots.get(4) == 108, slots
     assert slots.get(8) == 1343, slots
 
 
@@ -165,3 +180,103 @@ def test_detect_size_does_not_upscale_a_big_crop():
     tw, th, total = _quick_bar_detect_size((900, 400), 1.0)
     assert (tw, th) == (900, 400)
     assert total == 1.0
+
+
+def test_detect_steps_keep_normalisation_and_upscale_apart():
+    """The plan is applied as two resizes; the two-step order is what keeps the
+    max-resolution slot counts readable (see _quick_bar_detect_steps)."""
+    assert _quick_bar_detect_steps((282, 150), 1.8688) == ((151, 80), 1.8688, 3)
+    assert _quick_bar_detect_steps((151, 80), 1.0) == ((151, 80), 1.0, 3)
+    # Nothing to normalise, nothing to upscale: a big crop is fed as-is.
+    assert _quick_bar_detect_steps((900, 400), 1.0) == ((900, 400), 1.0, 1)
+    # A UI scale inside the tolerance band is ignored entirely.
+    assert _quick_bar_detect_steps((155, 82), 1.1) == ((155, 82), 1.0, 3)
+
+
+def test_ui_scale_from_quick_bar_box_is_anchor_free():
+    """A derived box's width IS the reference width times the UI scale, so it
+    still measures the frame when the LV->EXP span is unavailable."""
+    ref_w = 1351 - 1200  # regions.QUICK_BAR_FROM_STAT
+    box = (2268, 1154, 2268 + 282, 1304)
+    assert _ui_scale_from_quick_bar_box(box, (2559, 1439)) == pytest.approx(
+        282 / ref_w, abs=0.01
+    )
+    # A clamped box (touching a frame edge) can't be measured -> 1.0 ("unknown").
+    assert _ui_scale_from_quick_bar_box((2268, 1154, 2559, 1304), (2559, 1439)) == 1.0
+    # Too small to be a magnified quickbar -> 1.0.
+    assert _ui_scale_from_quick_bar_box((1210, 616, 1361, 696), (1366, 768)) == 1.0
+    assert _ui_scale_from_quick_bar_box(None, (1366, 768)) == 1.0
+
+
+def test_empty_quickbar_pass_retries_at_a_different_upscale():
+    """A pass that reads nothing gets one retry at 4x -- the detector's response
+    is not monotonic in input size; a pass that read counts is not retried."""
+    import types
+
+    from maple_analyzer.overlay import OverlayApp
+
+    def app_with(fake):
+        app = types.SimpleNamespace(
+            _ocr=None,
+            _quick_bar_ui_scale=1.87,
+            _log=lambda *a: None,
+            _save_quickbar_debug=lambda *a: None,
+            _grab_quick_bar_image=lambda: Image.new("RGB", (282, 150)),
+        )
+        app._detect_quick_slots = fake
+        return app
+
+    seen = []
+
+    def empty_then_hit(img, scale, up_override=None):
+        seen.append(up_override)
+        return ({}, []) if up_override is None else ({4: 108}, ["108"])
+
+    assert OverlayApp._read_slot_counts(app_with(empty_then_hit)) == {4: 108}
+    assert seen == [None, 4]
+
+    seen.clear()
+    always_hit = lambda img, scale, up_override=None: (seen.append(up_override) or ({8: 1343}, ["1343"]))
+    assert OverlayApp._read_slot_counts(app_with(always_hit)) == {8: 1343}
+    assert seen == [None]
+
+
+def test_quick_bar_scale_falls_back_to_the_box_without_a_span():
+    """_set_quick_bar_ui_scale takes the larger of the two measurements and
+    records which one it used (the failure log reports it). The box-derived
+    scale is the fallback for a locate pass that found only one of LV/EXP --
+    without it the magnified crop would be fed to the detector unnormalised."""
+    import types
+
+    from maple_analyzer.overlay import OverlayApp
+
+    app = types.SimpleNamespace()
+    frame = (2559, 1439)
+    box = (2268, 1154, 2550, 1304)
+    span = {"LV": (21 / 2559, 1385 / 1439, 178 / 2559, 38 / 1439),
+            "EXP": (1512 / 2559, 1365 / 1439, 207 / 2559, 33 / 1439)}
+    # Both available: they agree to ~0.3%, either is fine (the span wins as
+    # the larger), and the source says which one was used.
+    scale = OverlayApp._set_quick_bar_ui_scale(app, span, frame, box)
+    assert scale == pytest.approx(282 / 151, abs=0.01)
+    assert app._quick_bar_ui_scale_source == "span"
+    # Only one stat anchor -> _stat_ui_scale gives up with 1.0, and the box
+    # carries the measurement.
+    scale = OverlayApp._set_quick_bar_ui_scale(app, {"LV": span["LV"]}, frame, box)
+    assert scale == pytest.approx(282 / 151, abs=0.01)
+    assert app._quick_bar_ui_scale_source == "box"
+    # Neither (hand-marked quickbar rect, nothing detected) -> no normalisation.
+    scale = OverlayApp._set_quick_bar_ui_scale(app, None, frame)
+    assert scale == 1.0
+    assert app._quick_bar_ui_scale_source == "none"
+    # ...but a magnified crop proves the UI is magnified, so the last good
+    # scale is kept rather than dropping to 1.0 (which fed the detector an
+    # unnormalised magnified crop).
+    app._quick_bar_ui_scale = 1.87
+    scale = OverlayApp._set_quick_bar_ui_scale(app, None, frame, crop_size=(282, 150))
+    assert scale == pytest.approx(1.87)
+    assert app._quick_bar_ui_scale_source == "sticky"
+    # A reference-sized crop is never shrunk by a stale scale.
+    scale = OverlayApp._set_quick_bar_ui_scale(app, None, frame, crop_size=(151, 80))
+    assert scale == 1.0
+    assert app._quick_bar_ui_scale_source == "none"

@@ -56,7 +56,7 @@ from .i18n import Lang, t
 from .ocr import StatPanelOcr
 from .parser import ExpTotalTracker, StatSnapshot, find_meso_candidate_verified, find_meso_in_region, find_stat_fields, parse_fields, parse_meso
 from .rate import Session, SessionSummary
-from .regions import QUICK_BAR_FRAC, STAT_SPAN_PX, quick_bar_box_from_stat
+from .regions import QUICK_BAR_FRAC, QUICK_BAR_FROM_STAT, STAT_SPAN_PX, quick_bar_box_from_stat
 from .region_selector import RegionSelector
 from .settings import Settings, app_data_dir, load_settings, save_settings
 
@@ -397,6 +397,13 @@ def _quickbar_slots_from_boxes(
 
 _QUICK_BAR_MIN_NORM_SIDE = 300  # smallest side the detector wants, in 1366 pixels
 _QUICK_BAR_NORM_ABOVE = 1.15    # UI scale past which the crop is normalised
+# Width of the derived quickbar crop at the reference UI scale -- its width in
+# a captured frame IS this times the frame's UI scale (see
+# regions.QUICK_BAR_FROM_STAT), which is what makes it a usable scale probe.
+_QUICK_BAR_REF_WIDTH = float(QUICK_BAR_FROM_STAT[1] - QUICK_BAR_FROM_STAT[0])
+# Upscale the detector input by 3x, and if that pass finds NO counts at all,
+# try 4x once (each pass is ~0.6s and the read is on a 5s cadence).
+_QUICK_BAR_UPSCALES = (3, 4)
 
 
 def _merge_stat_boxes(old: dict | None, new: dict) -> dict:
@@ -438,28 +445,67 @@ def _stat_ui_scale(stat_boxes, width: float | int | None) -> float:
     return span / STAT_SPAN_PX
 
 
-def _quick_bar_detect_size(
+def _quick_bar_detect_steps(
     size: tuple[int, int], ui_scale: float
-) -> tuple[int, int, float]:
-    """Pixel size to run quickbar detection at, plus the factor back to it.
+) -> tuple[tuple[int, int], float, int]:
+    """Detector input plan for a quickbar crop: ((norm_w, norm_h), norm, up).
 
-    The quickbar crop is ~1366-UI-pixel sized on a native client, but on a
-    magnified/high-resolution frame it is `ui_scale` times bigger -- and the
-    detector's sweet spot is the reference size, so a big crop upscaled 3x more
-    reads as garbage. Measured 2026-09-11 on Alex's 1.87x frame (crop 282x149):
-    the shipped path returned {} and {8: 126} (a misread), the same crop
-    normalised to 151x80 and upscaled 3x read {4: 64, 8: 196} correctly. So:
-    normalise to reference pixels first, then apply the small-crop upscale.
+    The crop must be resized in TWO steps -- down to the reference-1366 pixel
+    size, THEN upscaled. Doing both in one resize (crop -> norm*up) blurs the
+    strokes just enough that the detector splits a slot count around a phantom
+    decimal point: measured 2026-09-14 on Alex's 1.87x frame (crop 282x150),
+    the one-step resize to 453x240 read the PgUp slot as '10.80', which
+    _quick_count_text rejects, so that slot showed no count at all, while
+    resizing to 151x80 first and then 3x read '108.' -> 108 (and the PgDn slot
+    stayed correct at 1343). The detector's response is not monotonic in the
+    input size, which is why the plan is applied step by step rather than
+    collapsed.
 
-    Returns (target_w, target_h, total_scale) where total_scale divides
-    detection coordinates back into the normalised crop's own frame -- the
-    frame _quickbar_slots_from_boxes expects (its geometry was tuned there).
+    `up` is 1 when the normalised crop is already big enough for the detector
+    (>= _QUICK_BAR_MIN_NORM_SIDE on its small side) -- those are the sizes the
+    geometry was tuned on.
     """
     w, h = size
     norm = float(ui_scale) if ui_scale and ui_scale > _QUICK_BAR_NORM_ABOVE else 1.0
     nw, nh = max(1, round(w / norm)), max(1, round(h / norm))
     up = 3 if min(nw, nh) < _QUICK_BAR_MIN_NORM_SIDE else 1
+    return (nw, nh), norm, up
+
+
+def _quick_bar_detect_size(
+    size: tuple[int, int], ui_scale: float
+) -> tuple[int, int, float]:
+    """Final detector input size and the factor back to the crop's own frame.
+
+    Total scale = up / norm, so dividing detection coordinates and the input
+    size by it lands both in the crop's ORIGINAL frame -- which is what
+    _quickbar_slots_from_boxes needs (it only uses fractions of w/h, so any
+    single consistent frame works; the tests use the same convention).
+    """
+    (nw, nh), norm, up = _quick_bar_detect_steps(size, ui_scale)
     return nw * up, nh * up, (up / norm)
+
+
+def _ui_scale_from_quick_bar_box(box, frame_size) -> float:
+    """The UI scale implied by a quickbar box derived from the stat strip.
+
+    quick_bar_box_from_stat builds the box as QUICK_BAR_FROM_STAT offsets times
+    the measured span scale, so an UNCLAMPED box's width IS the reference width
+    times the frame's UI scale. That makes this an anchor-free fallback for
+    _stat_ui_scale, which needs both the LV and the EXP boxes: when a locate
+    pass misses either one the scale stays 1.0 and the magnified crop is fed
+    to the detector unnormalised (the 2026-09-11 failure mode). Returns 1.0
+    when the box looks clamped or too small to measure.
+    """
+    if box is None or not frame_size:
+        return 1.0
+    left, top, right, bottom = box
+    w, h = frame_size
+    if left <= 0 or top <= 0 or right >= w or bottom >= h:
+        return 1.0  # clamped to the frame -> width is no longer s * reference
+    ref_w = _QUICK_BAR_REF_WIDTH
+    scale = (right - left) / ref_w
+    return scale if scale > _QUICK_BAR_NORM_ABOVE else 1.0
 
 
 # Number of history sessions at which the History tab starts nudging the user
@@ -665,6 +711,13 @@ class OverlayApp:
         # Detected meso counter box (fractions), refreshed every locate pass
         # so a dragged inventory window or a zoom change self-corrects.
         self._meso_box: tuple[float, float, float, float] | None = None
+        # UI scale the quickbar crop gets normalised by before detection, and
+        # which measurement produced it ('box' / 'span' / 'none') -- see
+        # _set_quick_bar_ui_scale.
+        self._quick_bar_ui_scale = 1.0
+        self._quick_bar_ui_scale_source = "none"
+        # Last detector input (image, total scale, OCR boxes) for the debug dump.
+        self._last_quick_debug: tuple | None = None
         # Manual-region capture source (see settings.manual_*): built lazily
         # when the user marks regions and toggles manual mode on, and used by
         # _active_source() in place of the auto GameWindowCapture.
@@ -1919,13 +1972,14 @@ class OverlayApp:
             if sys.platform != "win32":
                 return None
             l, t, r, b = s.manual_quick_bar_region
-            # A marked quickbar region is screen-sized, so tell the detector
-            # input scaler how big this UI is (measured against the marked stat
-            # strip's width, where the located fields' fractions live).
+            # A marked quickbar region is screen-sized and its rect is
+            # arbitrary, so the scale has to come from the stat strip (no box
+            # to measure -- see _set_quick_bar_ui_scale).
             region = s.manual_stat_region
-            self._quick_bar_ui_scale = _stat_ui_scale(
+            self._set_quick_bar_ui_scale(
                 getattr(self, "_stat_boxes", None),
-                (region[2] - region[0]) if region else None,
+                (region[2] - region[0], region[3] - region[1]) if region else None,
+                crop_size=(r - l, b - t),
             )
             try:
                 import mss
@@ -1945,12 +1999,12 @@ class OverlayApp:
             frame = self._active_source().grab_full()
         except Exception:
             return None
-        # Detection needs the crop scaled to reference pixels when the UI is
-        # magnified (see _quick_bar_detect_size).
-        self._quick_bar_ui_scale = _stat_ui_scale(
-            getattr(self, "_stat_boxes", None), frame.size[0]
-        )
         box = self._derived_quick_bar_box(frame.size)
+        # Detection needs the crop scaled to reference pixels when the UI is
+        # magnified (see _quick_bar_detect_steps).
+        self._set_quick_bar_ui_scale(
+            getattr(self, "_stat_boxes", None), frame.size, box
+        )
         if box is not None:
             return frame.crop(box)
         w, h = frame.size
@@ -1973,7 +2027,10 @@ class OverlayApp:
             return None
         left, top, right, bottom = region
         cw, ch = right - left, bottom - top
-        self._quick_bar_ui_scale = _stat_ui_scale(sb, cw)
+        # The box sits ABOVE the marked strip, so it lies outside this frame --
+        # the span measurement is the only usable scale here, and it is always
+        # available (the box needs both LV and EXP to exist at all).
+        self._set_quick_bar_ui_scale(sb, (cw, ch))
         lv, ex = sb["LV"], sb["EXP"]
         box = quick_bar_box_from_stat(
             left + lv[0] * cw,
@@ -1994,6 +2051,42 @@ class OverlayApp:
         except Exception:
             return None
 
+    def _set_quick_bar_ui_scale(
+        self, stat_boxes, frame_size, box=None, crop_size=None,
+    ) -> float:
+        """Record the UI scale the quickbar crop has to be normalised by.
+
+        Three sources, best available wins:
+          * a derived quickbar `box` (quick_bar_box_from_stat): its width IS
+            the reference width times the scale -- exact, and it needs no stat
+            anchor at all. Used whenever it is available and larger, which also
+            covers a locate pass that found only one of LV/EXP (the anchor
+            version silently falls back to 1.0 then, feeding the detector a
+            magnified crop unnormalised).
+          * the LV->EXP span (_stat_ui_scale).
+          * nothing measurable (a hand-marked quickbar rect plus a detection
+            pass that missed the anchors): keep the last scale that worked, but
+            only when the crop itself proves a magnified UI (`crop_size` wider
+            than the reference quickbar crop) -- otherwise a reference-sized
+            crop would get shrunk by a stale scale.
+        `_quick_bar_ui_scale_source` records which one was used, for the
+        failure log.
+        """
+        measured = _stat_ui_scale(stat_boxes, frame_size[0] if frame_size else None)
+        from_box = _ui_scale_from_quick_bar_box(box, frame_size)
+        if from_box > _QUICK_BAR_NORM_ABOVE and from_box > measured:
+            self._quick_bar_ui_scale, self._quick_bar_ui_scale_source = from_box, "box"
+        elif measured > _QUICK_BAR_NORM_ABOVE:
+            self._quick_bar_ui_scale, self._quick_bar_ui_scale_source = measured, "span"
+        else:
+            prev = getattr(self, "_quick_bar_ui_scale", 1.0)
+            magnified = bool(crop_size) and crop_size[0] > _QUICK_BAR_REF_WIDTH * _QUICK_BAR_NORM_ABOVE
+            if magnified and prev > _QUICK_BAR_NORM_ABOVE:
+                self._quick_bar_ui_scale, self._quick_bar_ui_scale_source = prev, "sticky"
+            else:
+                self._quick_bar_ui_scale, self._quick_bar_ui_scale_source = 1.0, "none"
+        return self._quick_bar_ui_scale
+
     def _save_quickbar_debug(self, img=None, scale: float = 1.0, boxes=None) -> None:
         """Dump the quickbar crop + OCR boxes next to the app so a failing
         potion read can be diagnosed from the image instead of guesswork
@@ -2008,6 +2101,42 @@ class OverlayApp:
                 f.write(f"boxes={boxes!r}\n")
         except Exception:
             pass
+
+    def _detect_quick_slots(
+        self, img: Image.Image, ui_scale: float, up_override: int | None = None,
+    ) -> tuple[dict[int, int], list[str]]:
+        """One quickbar detection pass at the planned (or overridden) upscale.
+
+        Returns (slots, all_ocr_texts). The crop is normalised to reference
+        pixels and THEN upscaled -- two separate resizes, see
+        _quick_bar_detect_steps; doing it in one resize makes the detector
+        split the PgUp slot's count around a phantom decimal point on a
+        magnified frame (2026-09-14).
+        """
+        (nw, nh), norm, up = _quick_bar_detect_steps(img.size, ui_scale)
+        if up_override is not None:
+            up = up_override
+        if (nw, nh) != img.size:
+            img = img.resize((nw, nh), Image.Resampling.LANCZOS)
+        if up != 1:
+            img = img.resize((nw * up, nh * up), Image.Resampling.LANCZOS)
+        total = up / norm
+        try:
+            boxes = self._ocr.detect_text(img)
+        except Exception:
+            return {}, []
+        if total != 1.0:
+            boxes = [
+                (int(x / total), int(y / total), int(bw / total), int(bh / total), text)
+                for x, y, bw, bh, text in boxes
+            ]
+            w, h = int(round(img.width / total)), int(round(img.height / total))
+        else:
+            w, h = img.size
+        if w <= 0 or h <= 0:
+            return {}, [text for *_r, text in boxes]
+        self._last_quick_debug = (img, total, boxes)
+        return _quickbar_slots_from_boxes(boxes, w, h), [text for *_r, text in boxes]
 
     def _read_slot_counts(self, debug_out: bool = False) -> dict[int, int]:
         """Detect the potion count in each of the 8 quickbar slots, returning
@@ -2024,39 +2153,38 @@ class OverlayApp:
             if debug_out:
                 self._save_quickbar_debug()
             return {}
-        # Normalise the crop back to reference-1366 pixels FIRST, then upscale
-        # small crops (LANCZOS, cheap on a region this size). 3x, not 2x: the
-        # digits are ~11px tall at 1366 and 2x still dropped the counts on the
-        # magnified sample (measured 2026-09-10 across the three patched
-        # screenshots; 3x reads all three). The normalisation is what makes
-        # that measurement hold on a magnified frame too: its crop is already
-        # ~1.87x those pixels, and upscaling THAT another 3x pushed the
-        # detector out of its range -- Alex's max-resolution frames came back
-        # {} / {8: 126} (a misread) while the same crop normalised to 151x80
-        # read {4: 64, 8: 196} correctly (2026-09-11).
-        target_w, target_h, total = _quick_bar_detect_size(
-            img.size, getattr(self, "_quick_bar_ui_scale", 1.0)
-        )
-        if (target_w, target_h) != img.size:
-            img = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
-        try:
-            boxes = self._ocr.detect_text(img)
-        except Exception:
-            return {}
+        scale = getattr(self, "_quick_bar_ui_scale", 1.0)
+        self._last_quick_debug = None
+        slots, texts = self._detect_quick_slots(img, scale)
+        if not slots:
+            # A pass that read nothing at all gets one retry at a different
+            # upscale: the detector's response is not monotonic in input size
+            # (on the 1.87x frame the 2x pass read '10.8.' for the PgUp slot
+            # while the 3x/4x/5x passes read it correctly). ~0.6s extra, and
+            # only on an otherwise empty read.
+            for alt in _QUICK_BAR_UPSCALES[1:]:
+                alt_slots, alt_texts = self._detect_quick_slots(img, scale, up_override=alt)
+                if alt_slots:
+                    slots, texts = alt_slots, alt_texts
+                    break
+        if not slots:
+            # Leave a trail: the scale, the input size and what the detector
+            # actually said is what pins a max-resolution miss down (the
+            # '10.80'-style misreads only show up here).
+            self._log(
+                f"[{time.strftime('%H:%M:%S')}] quickbar read failed: "
+                f"ui_scale={scale:.3f} crop={img.size} scale_set="
+                f"{getattr(self, '_quick_bar_ui_scale_source', '?')} texts={texts!r}"
+            )
         if debug_out:
             # Save the crop + boxes at the SAME scale (both pre-downscale)
             # so the dump matches the image pixel-for-pixel when diagnosing.
-            self._save_quickbar_debug(img, total, boxes)
-        w, h = img.size
-        if w <= 0 or h <= 0:
-            return {}
-        if total != 1.0:
-            boxes = [
-                (int(x / total), int(y / total), int(bw / total), int(bh / total), text)
-                for x, y, bw, bh, text in boxes
-            ]
-            w, h = int(round(w / total)), int(round(h / total))
-        return _quickbar_slots_from_boxes(boxes, w, h)
+            dbg = getattr(self, "_last_quick_debug", None)
+            if dbg is not None:
+                self._save_quickbar_debug(*dbg)
+            else:
+                self._save_quickbar_debug()
+        return slots
 
     def _scan_quick_slots_to_last(self) -> None:
         """Read the quick-slot potion counts and stash them in the _last_*
