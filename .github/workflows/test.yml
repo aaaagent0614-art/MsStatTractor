@@ -1,0 +1,53 @@
+# Run the test suite on Alex's own Windows PC (self-hosted runner "alex-pc").
+#
+# SECURITY: this repo is PUBLIC. A self-hosted runner must never be triggered
+# by pull_request / pull_request_target -- a stranger's PR would then execute
+# their code on Alex's real machine. Only `push` (needs write access) and
+# `workflow_dispatch` (only Alex / maintainers) are allowed here. Do not add
+# PR triggers to this file.
+#
+# The release build stays on GitHub's cloud runners (build-release.yml);
+# this job only runs pytest.
+name: Test (self-hosted Windows)
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: [self-hosted, windows, alex-pc]
+    timeout-minutes: 30
+
+    steps:
+      - name: Runner info
+        shell: pwsh
+        run: |
+          Write-Host "Runner : $env:RUNNER_NAME"
+          Write-Host "OS     : $([System.Environment]::OSVersion.VersionString)"
+          $py = Get-Command python -ErrorAction SilentlyContinue
+          if (-not $py) {
+            Write-Host "::error::python not found on PATH -- install Python 3.11+ and re-run"
+            exit 1
+          }
+          Write-Host "Python : $($py.Source)"
+          python --version
+          git --version
+
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run pytest
+        shell: pwsh
+        run: |
+          python -m pytest tests -v --tb=short
