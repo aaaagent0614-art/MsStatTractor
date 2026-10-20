@@ -21,7 +21,9 @@ concurrency:
 
 jobs:
   pytest:
-    runs-on: [self-hosted, windows, alex-pc]
+    # 只用 self-hosted 匹配（只有這一台 runner，不需要更精細的 label）。
+    # 加上 alex-pc / windows 這種自訂 label 會因為註冊時沒帶到而永遠 queued。
+    runs-on: [self-hosted]
     timeout-minutes: 30
 
     steps:
