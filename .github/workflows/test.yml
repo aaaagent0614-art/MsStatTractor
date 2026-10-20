@@ -1,4 +1,4 @@
-# Run the test suite on Alex's own Windows PC (self-hosted runner "alex-pc").
+# Run the test suite on Alex's own Windows PC (self-hosted runner "ALEX").
 #
 # SECURITY: this repo is PUBLIC. A self-hosted runner must never be triggered
 # by pull_request / pull_request_target -- a stranger's PR would then execute
@@ -27,29 +27,30 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      - uses: actions/checkout@v4
+
+      # 不依賴機器自己的 Python：runner 服務以 SYSTEM 身分執行，看不到使用者
+      # PATH 裡的 Python；而且 app 本身是 PyInstaller 打包的 exe，機器上不需要
+      # 裝 Python。setup-python 會在 runner 的 _work 目錄快取一個固定解譯器。
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Runner info
-        shell: pwsh
+        shell: powershell
         run: |
           Write-Host "Runner : $env:RUNNER_NAME"
           Write-Host "OS     : $([System.Environment]::OSVersion.VersionString)"
-          $py = Get-Command python -ErrorAction SilentlyContinue
-          if (-not $py) {
-            Write-Host "::error::python not found on PATH -- install Python 3.11+ and re-run"
-            exit 1
-          }
-          Write-Host "Python : $($py.Source)"
           python --version
           git --version
 
-      - uses: actions/checkout@v4
-
       - name: Install dependencies
-        shell: pwsh
+        shell: powershell
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Run pytest
-        shell: pwsh
+        shell: powershell
         run: |
           python -m pytest tests -v --tb=short
