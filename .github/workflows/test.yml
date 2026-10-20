@@ -29,34 +29,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 不用 actions/setup-python：它在這台 self-hosted runner 上會失敗（拿不到
-      # log 查明原因）。也不用機器自己的 Python：服務以 SYSTEM 身分執行，看不到
-      # 使用者 PATH 的安裝；而且 app 是 PyInstaller 打包的 exe，機器上本來就
-      # 不需要 Python。
-      #
-      # 改成：直接用 python.org 官方 installer 靜默裝到固定路徑，只裝一次。
-      # 3.11.9 是 3.11 系列最後一個有 Windows 安裝檔的版本（之後只有 source）。
-      # 裝完把路徑寫進 GITHUB_PATH，後面每個 step 直接叫 python 就行。
-      - name: Ensure Python 3.11
+      # 不用 actions/setup-python（在這台 self-hosted runner 上會失敗），也不讓
+      # runner 自己跑 installer（SYSTEM 身分跑 python.org installer 不順）。
+      # Python 由 Alex 在管理員 PowerShell 手動裝一次到 C:\ci-python311（全機器
+      # 安裝，SYSTEM 也看得到）。這裡只負責確認它在、把它加進 PATH。
+      - name: Locate Python 3.11
         shell: powershell
         run: |
           $pyDir = "C:\ci-python311"
           $py    = Join-Path $pyDir "python.exe"
           if (-not (Test-Path $py)) {
-            Write-Host "Installing Python 3.11.9 -> $pyDir"
-            $url = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"
-            $out = Join-Path $env:TEMP "python-3.11.9-amd64.exe"
-            Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
-            $installArgs = @(
-              "/quiet", "InstallAllUsers=1", "TargetDir=$pyDir",
-              "Include_pip=1", "Include_test=0", "Include_launcher=0",
-              "Shortcuts=0", "AssociateFiles=0", "PrependPath=0"
-            )
-            $p = Start-Process -FilePath $out -ArgumentList $installArgs -Wait -PassThru
-            Remove-Item $out -Force -ErrorAction SilentlyContinue
-            if (-not (Test-Path $py)) { throw "Python install failed (exit=$($p.ExitCode))" }
-          } else {
-            Write-Host "Python already present at $pyDir (cached)"
+            Write-Host "::error::Python not found at $pyDir"
+            Write-Host "Install once in an elevated PowerShell:"
+            Write-Host '  Invoke-WebRequest -Uri https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe -OutFile $env:TEMP\py311.exe'
+            Write-Host '  Start-Process $env:TEMP\py311.exe -ArgumentList "/quiet","InstallAllUsers=1","TargetDir=C:\ci-python311","Include_pip=1" -Wait'
+            exit 1
           }
           & $py --version
           & $py -m pip --version
