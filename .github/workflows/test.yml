@@ -1,0 +1,69 @@
+# Run the test suite on Alex's own Windows PC (self-hosted runner "ALEX").
+#
+# SECURITY: this repo is PUBLIC. A self-hosted runner must never be triggered
+# by pull_request / pull_request_target -- a stranger's PR would then execute
+# their code on Alex's real machine. Only `push` (needs write access) and
+# `workflow_dispatch` (only Alex / maintainers) are allowed here. Do not add
+# PR triggers to this file.
+#
+# The release build stays on GitHub's cloud runners (build-release.yml);
+# this job only runs pytest.
+name: Test (self-hosted Windows)
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    # 只用 self-hosted 匹配（只有這一台 runner，不需要更精細的 label）。
+    # 加上 alex-pc / windows 這種自訂 label 會因為註冊時沒帶到而永遠 queued。
+    runs-on: [self-hosted]
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 不用 actions/setup-python（在這台 self-hosted runner 上會失敗），也不讓
+      # runner 自己跑 installer（SYSTEM 身分跑 python.org installer 不順）。
+      # Python 由 Alex 在管理員 PowerShell 手動裝一次到 C:\ci-python311（全機器
+      # 安裝，SYSTEM 也看得到）。這裡只負責確認它在、把它加進 PATH。
+      - name: Locate Python 3.11
+        shell: powershell
+        run: |
+          $pyDir = "C:\ci-python311"
+          $py    = Join-Path $pyDir "python.exe"
+          if (-not (Test-Path $py)) {
+            Write-Host "::error::Python not found at $pyDir"
+            Write-Host "Install once in an elevated PowerShell:"
+            Write-Host '  Invoke-WebRequest -Uri https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe -OutFile $env:TEMP\py311.exe'
+            Write-Host '  Start-Process $env:TEMP\py311.exe -ArgumentList "/quiet","InstallAllUsers=1","TargetDir=C:\ci-python311","Include_pip=1" -Wait'
+            exit 1
+          }
+          & $py --version
+          & $py -m pip --version
+          $pyDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Runner info
+        shell: powershell
+        run: |
+          Write-Host "Runner : $env:RUNNER_NAME"
+          Write-Host "OS     : $([System.Environment]::OSVersion.VersionString)"
+          python --version
+          git --version
+
+      - name: Install dependencies
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run pytest
+        shell: powershell
+        run: |
+          python -m pytest tests -v --tb=short
